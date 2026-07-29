@@ -69,6 +69,33 @@ info() { printf '    %s\n' "$*"; }
 warn() { printf '\033[1;33m    warning:\033[0m %s\n' "$*" >&2; }
 die()  { printf '\033[1;31m==> error:\033[0m %s\n' "$*" >&2; exit 1; }
 
+TMPWORK="$(mktemp -d "${TMPDIR:-/tmp}/setup.XXXXXX")"
+trap 'rm -rf "$TMPWORK"' EXIT
+
+# Run a third-party install script safely.
+#
+# `curl URL | sh` gives the installer *our* stdin. Under `curl setup.sh | bash`
+# that stdin is this script's own source, so an installer that stops to ask
+# "Start Codex now? [y/N]" reads a line of shell text as the answer, and
+# whatever it does next has eaten part of the script bash has yet to parse.
+#
+# So: download to a file, run the file, and hand it /dev/null as stdin — a
+# prompt then gets EOF and takes its default. setsid additionally drops the
+# controlling terminal, so an installer that opens /dev/tty explicitly cannot
+# find one either. --wait keeps the exit status, which --fork alone would lose.
+run_installer() {
+  local sh_bin="$1" url="$2" dst
+  shift 2
+  dst="$TMPWORK/$(basename "${url%%\?*}")"
+  curl -fsSL "$url" -o "$dst" || die "could not download $url"
+  [[ -s "$dst" ]] || die "$url returned an empty file"
+  if setsid --wait true >/dev/null 2>&1; then
+    setsid --wait "$sh_bin" "$dst" "$@" </dev/null
+  else
+    "$sh_bin" "$dst" "$@" </dev/null
+  fi
+}
+
 # ---------------------------------------------------------------------------
 # 0. Preflight
 # ---------------------------------------------------------------------------
@@ -130,6 +157,14 @@ if [[ -n "${SSH_CONNECTION:-}" && -z "${TMUX:-}" && -z "${STY:-}" ]]; then
   warn "running over SSH outside tmux/screen — a disconnect will kill this run."
   warn "consider: tmux new -As setup, then re-run."
   [[ -t 1 ]] && sleep 5
+fi
+
+# Piped into bash, this script *is* stdin, so step 10 cannot read a pasted code
+# and is skipped. Say so now rather than at the end of a 20-minute run.
+if [[ ! -t 0 ]] && [[ ! -f "${BASH_SOURCE[0]:-}" ]]; then
+  warn "this script is being read from stdin (curl | bash)."
+  warn "provisioning works, but sign-in needs a terminal and will be skipped."
+  warn "to sign in during the run: save it to a file and execute that instead."
 fi
 
 # systemctl --user needs a running user manager, which exists in a normal login
@@ -223,7 +258,11 @@ if command -v codex >/dev/null 2>&1; then
 fi
 
 if ! command -v codex >/dev/null 2>&1; then
-  curl -fsSL https://chatgpt.com/codex/install.sh | sh
+  # Codex's installer added CODEX_NON_INTERACTIVE for headless installs in
+  # 0.136.0; belt and braces alongside the /dev/null stdin above.
+  export CODEX_NON_INTERACTIVE=1
+  run_installer sh https://chatgpt.com/codex/install.sh \
+    || die "the Codex installer failed"
 fi
 
 hash -r
@@ -242,7 +281,7 @@ log "Installing Claude Code"
 if command -v claude >/dev/null 2>&1; then
   info "found $(claude --version 2>&1 | head -1) — native installs self-update"
 else
-  curl -fsSL https://claude.ai/install.sh | bash
+  run_installer bash https://claude.ai/install.sh || die "the Claude Code installer failed"
   hash -r
 fi
 command -v claude >/dev/null || die "claude not on PATH after install; open a new shell and re-run"
@@ -264,7 +303,7 @@ if command -v uv >/dev/null 2>&1; then
   info "$(uv --version)"
   uv self update </dev/null 2>/dev/null || info "uv is externally managed; skipping self-update"
 else
-  curl -LsSf https://astral.sh/uv/install.sh | sh
+  run_installer sh https://astral.sh/uv/install.sh || die "the uv installer failed"
   hash -r
 fi
 command -v uv >/dev/null || die "uv not on PATH after install"
