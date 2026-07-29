@@ -13,6 +13,13 @@
 # Usage:
 #   ./setup.sh
 #
+# Runs unattended wherever sudo does not prompt (NOPASSWD in sudoers), so all of
+# these work as well:
+#   curl -fsSL .../setup.sh | bash
+#   ssh host 'bash -s' <setup.sh
+#   ssh host './setup.sh'
+# Where sudo does want a password, a terminal is still required.
+#
 # Environment overrides:
 #   CODEX_MODEL       model written to config.toml        (default: gpt-5.6-sol)
 #   CODEX_EFFORT      model_reasoning_effort              (default: xhigh)
@@ -30,6 +37,11 @@ CODEX_EFFORT="${CODEX_EFFORT:-xhigh}"
 CODEX_LB_HOST="${CODEX_LB_HOST:-0.0.0.0}"
 CODEX_LB_PORT="${CODEX_LB_PORT:-2455}"
 SKIP_APT_UPGRADE="${SKIP_APT_UPGRADE:-0}"
+
+# Non-login shells (cron, `ssh host 'cmd'`, `docker exec`) often do not export
+# USER, and `set -u` turns that into a hard failure. HOME is set by PAM/sshd in
+# every context this script supports, so only USER needs a fallback.
+USER="${USER:-$(id -un)}"
 
 LOCAL_BIN="$HOME/.local/bin"
 CODEX_HOME="$HOME/.codex"
@@ -56,7 +68,37 @@ info "home      : $HOME"
 info "codex-lb  : ${CODEX_LB_HOST}:${CODEX_LB_PORT}"
 info "model     : ${CODEX_MODEL} (reasoning effort: ${CODEX_EFFORT})"
 
-sudo -v || die "could not acquire sudo credentials"
+# Non-interactive sudo. `sudo -v` prompts, which means it fails under
+# `curl | bash`, in CI, and over `ssh host <script`. `sudo -n` never prompts, so
+# every privileged call below goes through "${SUDO[@]}" instead of bare sudo.
+#
+# A command-scoped rule (NOPASSWD: /usr/bin/apt-get) makes `sudo -n true` fail
+# even though every apt call here would succeed, so probe apt-get separately
+# before giving up.
+SUDO=(sudo -n)
+if sudo -n true 2>/dev/null; then
+  info "sudo      : passwordless"
+elif sudo -n apt-get --version >/dev/null 2>&1; then
+  info "sudo      : passwordless for apt-get only"
+elif [[ -t 0 ]]; then
+  SUDO=(sudo)
+  warn "sudo will prompt for a password"
+  sudo -v || die "could not acquire sudo credentials"
+else
+  die "no passwordless sudo, and no terminal to prompt on. As root, run:
+      echo '$USER ALL=(ALL) NOPASSWD:ALL' >/etc/sudoers.d/90-$USER
+      chmod 0440 /etc/sudoers.d/90-$USER
+      visudo -cf /etc/sudoers.d/90-$USER"
+fi
+
+# systemctl --user needs a running user manager, which exists in a normal login
+# or `machinectl shell` session but not under bare `su -`, and not in a
+# container without systemd as PID 1. Checked here so it fails in the preflight
+# rather than after apt has already spent five minutes upgrading.
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+systemctl --user show-environment >/dev/null 2>&1 || die \
+  "no systemd --user manager for $USER (XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR).
+      Log in as $USER directly, or from root: machinectl shell $USER@"
 
 export DEBIAN_FRONTEND=noninteractive
 export PATH="$LOCAL_BIN:$PATH"
@@ -67,20 +109,20 @@ mkdir -p "$LOCAL_BIN" "$CODEX_HOME" "$UNIT_DIR"
 # ---------------------------------------------------------------------------
 log "Updating system packages"
 
-sudo apt-get update -y
+"${SUDO[@]}" apt-get update -y
 
 if [[ "$SKIP_APT_UPGRADE" != "1" ]]; then
-  sudo apt-get full-upgrade -y
+  "${SUDO[@]}" apt-get full-upgrade -y
 else
   info "SKIP_APT_UPGRADE=1 — skipping full-upgrade"
 fi
 
 # bubblewrap is the sandbox backend Codex expects on PATH; without it the
 # app-server falls back to its bundled copy and logs an error on every start.
-sudo apt-get install -y --no-install-recommends \
+"${SUDO[@]}" apt-get install -y --no-install-recommends \
   ca-certificates curl wget git gnupg jq python3 unzip bubblewrap
 
-sudo apt-get autoremove -y
+"${SUDO[@]}" apt-get autoremove -y
 
 # ---------------------------------------------------------------------------
 # 2. Make ~/.local/bin permanently available on PATH
@@ -108,19 +150,19 @@ GH_LIST=/etc/apt/sources.list.d/github-cli.list
 
 if [[ ! -s "$GH_KEYRING" ]]; then
   wget -qO- https://cli.github.com/packages/githubcli-archive-keyring.gpg \
-    | sudo tee "$GH_KEYRING" >/dev/null
-  sudo chmod go+r "$GH_KEYRING"
+    | "${SUDO[@]}" tee "$GH_KEYRING" >/dev/null
+  "${SUDO[@]}" chmod go+r "$GH_KEYRING"
   info "installed apt keyring"
 fi
 
 GH_REPO="deb [arch=$(dpkg --print-architecture) signed-by=$GH_KEYRING] https://cli.github.com/packages stable main"
 if [[ ! -f "$GH_LIST" ]] || ! grep -qF "$GH_REPO" "$GH_LIST"; then
-  echo "$GH_REPO" | sudo tee "$GH_LIST" >/dev/null
-  sudo apt-get update -y
+  echo "$GH_REPO" | "${SUDO[@]}" tee "$GH_LIST" >/dev/null
+  "${SUDO[@]}" apt-get update -y
   info "added cli.github.com apt repository"
 fi
 
-sudo apt-get install -y gh
+"${SUDO[@]}" apt-get install -y gh
 info "$(gh --version | head -1)"
 
 # A pre-existing ~/.local/bin/gh binary would shadow the apt-managed one.
@@ -136,7 +178,7 @@ log "Installing Codex CLI"
 
 if command -v codex >/dev/null 2>&1; then
   info "found $(codex --version 2>&1 | head -1) — upgrading in place"
-  codex update || warn "codex update failed; falling back to the install script"
+  codex update </dev/null || warn "codex update failed; falling back to the install script"
 fi
 
 if ! command -v codex >/dev/null 2>&1; then
@@ -154,7 +196,7 @@ log "Installing uv"
 
 if command -v uv >/dev/null 2>&1; then
   info "$(uv --version)"
-  uv self update 2>/dev/null || info "uv is externally managed; skipping self-update"
+  uv self update </dev/null 2>/dev/null || info "uv is externally managed; skipping self-update"
 else
   curl -LsSf https://astral.sh/uv/install.sh | sh
   hash -r
@@ -206,7 +248,7 @@ info "wrote $UNIT"
 # Lingering keeps the user manager (and therefore codex-lb) alive across
 # logout and starts it at boot without an interactive session.
 if ! loginctl show-user "$USER" --property=Linger 2>/dev/null | grep -q 'Linger=yes'; then
-  sudo loginctl enable-linger "$USER"
+  "${SUDO[@]}" loginctl enable-linger "$USER"
   info "enabled systemd lingering for $USER"
 else
   info "systemd lingering already enabled"
@@ -338,12 +380,12 @@ PY
 # Bootstrapped last so the daemon starts with the codex-lb provider in place.
 log "Setting up the Codex app-server daemon"
 
-if codex app-server daemon bootstrap --remote-control; then
+if codex app-server daemon bootstrap --remote-control </dev/null; then
   info "app-server bootstrapped with remote control enabled"
 else
   warn "bootstrap failed — retrying as a plain restart"
-  codex app-server daemon restart || warn "could not start the app-server daemon"
-  codex app-server daemon enable-remote-control || warn "could not enable remote control"
+  codex app-server daemon restart </dev/null || warn "could not start the app-server daemon"
+  codex app-server daemon enable-remote-control </dev/null || warn "could not enable remote control"
 fi
 
 APP_SERVER_STATE="$(codex app-server daemon version 2>/dev/null || echo '{}')"
