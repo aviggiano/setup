@@ -7,6 +7,8 @@
 #   * codex-lb                 via `uv tool install` + a systemd --user service
 #   * ~/.codex/config.toml     pointed at the local codex-lb endpoint
 #   * Codex app-server daemon  bootstrapped with remote control enabled
+#   * Claude Code              via https://claude.ai/install.sh
+#   * sign-in                  gh, then Claude Code — interactive, last, in series
 #
 # Idempotent: safe to re-run to upgrade an existing install.
 #
@@ -26,6 +28,12 @@
 #   CODEX_LB_HOST     interface codex-lb binds to         (default: 0.0.0.0)
 #   CODEX_LB_PORT     port codex-lb listens on            (default: 2455)
 #   SKIP_APT_UPGRADE  set to 1 to skip the apt upgrade step
+#   CLAUDE_AUTH       login (browser OAuth, default) | token (setup-token) | skip
+#
+# Steps 1-9 are unattended. Step 10 signs you in and needs a terminal; with no
+# TTY it is skipped and the commands are printed instead, so the provisioning
+# still completes. Run it under tmux — an apt upgrade can restart the service
+# carrying your SSH session.
 #
 set -euo pipefail
 
@@ -37,6 +45,14 @@ CODEX_EFFORT="${CODEX_EFFORT:-xhigh}"
 CODEX_LB_HOST="${CODEX_LB_HOST:-0.0.0.0}"
 CODEX_LB_PORT="${CODEX_LB_PORT:-2455}"
 SKIP_APT_UPGRADE="${SKIP_APT_UPGRADE:-0}"
+# login = browser OAuth, full credentials (needed for Remote Control)
+# token = `claude setup-token`, model requests only
+# skip  = leave sign-in to you
+CLAUDE_AUTH="${CLAUDE_AUTH:-login}"
+case "$CLAUDE_AUTH" in
+  login | token | skip) ;;
+  *) printf 'CLAUDE_AUTH must be login, token or skip (got: %s)\n' "$CLAUDE_AUTH" >&2; exit 1 ;;
+esac
 
 # Non-login shells (cron, `ssh host 'cmd'`, `docker exec`) often do not export
 # USER, and `set -u` turns that into a hard failure. HOME is set by PAM/sshd in
@@ -76,12 +92,29 @@ info "model     : ${CODEX_MODEL} (reasoning effort: ${CODEX_EFFORT})"
 # even though every apt call here would succeed, so probe apt-get separately
 # before giving up.
 SUDO=(sudo -n)
+# needrestart's apt hook restarts every service holding an upgraded library.
+# On this kind of box that includes the one carrying your SSH session (sshd,
+# tailscaled, ...), which kills the script mid-run. NEEDRESTART_SUSPEND=1 turns
+# the hook off for these invocations.
+#
+# It has to be set *through* sudo: with the default env_reset, sudo strips the
+# caller's environment, and `sudo VAR=x` / `sudo -E` both need a SETENV tag that
+# a plain NOPASSWD:ALL rule does not grant. `sudo env VAR=x cmd` always works.
+APT_ENV=(env NEEDRESTART_SUSPEND=1 DEBIAN_FRONTEND=noninteractive)
 if sudo -n true 2>/dev/null; then
   info "sudo      : passwordless"
+  APT=("${SUDO[@]}" "${APT_ENV[@]}" apt-get)
 elif sudo -n apt-get --version >/dev/null 2>&1; then
   info "sudo      : passwordless for apt-get only"
+  # A rule scoped to apt-get will not authorise /usr/bin/env, so drop the
+  # wrapper and rely on the needrestart config file instead.
+  APT=("${SUDO[@]}" apt-get)
+  warn "cannot pass NEEDRESTART_SUSPEND through a command-scoped sudo rule."
+  warn "if apt restarts your network service the session dies; make it permanent:"
+  warn "  echo \"\\\$nrconf{restart} = 'l';\" | sudo tee /etc/needrestart/conf.d/50-list-only.conf"
 elif [[ -t 0 ]]; then
   SUDO=(sudo)
+  APT=("${SUDO[@]}" "${APT_ENV[@]}" apt-get)
   warn "sudo will prompt for a password"
   sudo -v || die "could not acquire sudo credentials"
 else
@@ -89,6 +122,14 @@ else
       echo '$USER ALL=(ALL) NOPASSWD:ALL' >/etc/sudoers.d/90-$USER
       chmod 0440 /etc/sudoers.d/90-$USER
       visudo -cf /etc/sudoers.d/90-$USER"
+fi
+
+# A dropped SSH session takes the script with it (SIGHUP), and step 1 alone can
+# run for half an hour. tmux makes that survivable.
+if [[ -n "${SSH_CONNECTION:-}" && -z "${TMUX:-}" && -z "${STY:-}" ]]; then
+  warn "running over SSH outside tmux/screen — a disconnect will kill this run."
+  warn "consider: tmux new -As setup, then re-run."
+  [[ -t 1 ]] && sleep 5
 fi
 
 # systemctl --user needs a running user manager, which exists in a normal login
@@ -109,20 +150,20 @@ mkdir -p "$LOCAL_BIN" "$CODEX_HOME" "$UNIT_DIR"
 # ---------------------------------------------------------------------------
 log "Updating system packages"
 
-"${SUDO[@]}" apt-get update -y
+"${APT[@]}" update -y
 
 if [[ "$SKIP_APT_UPGRADE" != "1" ]]; then
-  "${SUDO[@]}" apt-get full-upgrade -y
+  "${APT[@]}" full-upgrade -y
 else
   info "SKIP_APT_UPGRADE=1 — skipping full-upgrade"
 fi
 
 # bubblewrap is the sandbox backend Codex expects on PATH; without it the
 # app-server falls back to its bundled copy and logs an error on every start.
-"${SUDO[@]}" apt-get install -y --no-install-recommends \
+"${APT[@]}" install -y --no-install-recommends \
   ca-certificates curl wget git gnupg jq python3 unzip bubblewrap
 
-"${SUDO[@]}" apt-get autoremove -y
+"${APT[@]}" autoremove -y
 
 # ---------------------------------------------------------------------------
 # 2. Make ~/.local/bin permanently available on PATH
@@ -158,11 +199,11 @@ fi
 GH_REPO="deb [arch=$(dpkg --print-architecture) signed-by=$GH_KEYRING] https://cli.github.com/packages stable main"
 if [[ ! -f "$GH_LIST" ]] || ! grep -qF "$GH_REPO" "$GH_LIST"; then
   echo "$GH_REPO" | "${SUDO[@]}" tee "$GH_LIST" >/dev/null
-  "${SUDO[@]}" apt-get update -y
+  "${APT[@]}" update -y
   info "added cli.github.com apt repository"
 fi
 
-"${SUDO[@]}" apt-get install -y gh
+"${APT[@]}" install -y gh
 info "$(gh --version | head -1)"
 
 # A pre-existing ~/.local/bin/gh binary would shadow the apt-managed one.
@@ -188,6 +229,31 @@ fi
 hash -r
 command -v codex >/dev/null || die "codex not on PATH after install; open a new shell and re-run"
 info "$(codex --version 2>&1 | head -1)"
+
+# ---------------------------------------------------------------------------
+# 4b. Claude Code
+# ---------------------------------------------------------------------------
+# The native installer is Anthropic's recommended install; it drops a launcher
+# at ~/.local/bin/claude and self-updates in the background, so there is no
+# apt/npm package to keep current here.
+#   https://code.claude.com/docs/en/setup
+log "Installing Claude Code"
+
+if command -v claude >/dev/null 2>&1; then
+  info "found $(claude --version 2>&1 | head -1) — native installs self-update"
+else
+  curl -fsSL https://claude.ai/install.sh | bash
+  hash -r
+fi
+command -v claude >/dev/null || die "claude not on PATH after install; open a new shell and re-run"
+info "$(claude --version 2>&1 | head -1)"
+
+# An API key outranks subscription credentials, so a stray one silently moves
+# usage onto API billing. Warn rather than unset — it may be deliberate.
+if [[ -n "${ANTHROPIC_API_KEY:-}" ]]; then
+  warn "ANTHROPIC_API_KEY is set; it takes precedence over subscription login."
+  warn "unset it if you want this box to bill against Pro/Max instead."
+fi
 
 # ---------------------------------------------------------------------------
 # 5. uv + codex-lb
@@ -398,13 +464,121 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 10. Summary
+# 10. Interactive sign-in (gh, then Claude Code) — in series, last
+# ---------------------------------------------------------------------------
+# Everything above is unattended. These two are not: each prints a code or URL,
+# waits for you to finish in a browser elsewhere, and must not overlap with the
+# other or you end up pasting the wrong code into the wrong page. So they run
+# one at a time, at the very end, and a failure stops the script rather than
+# falling through to a summary that claims success.
+log "Interactive sign-in"
+
+CLAUDE_CREDS="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/.credentials.json"
+
+if [[ "$CLAUDE_AUTH" == "skip" ]] || [[ ! -t 0 ]] || [[ ! -t 1 ]]; then
+  if [[ "$CLAUDE_AUTH" == "skip" ]]; then
+    info "CLAUDE_AUTH=skip — not signing in"
+  else
+    info "no terminal — skipping sign-in (provisioning above is complete)"
+  fi
+  info "run these yourself, one at a time:"
+  info "    GH_BROWSER=true gh auth login --hostname github.com --git-protocol https --web"
+  info "    claude          # complete /login, then /exit"
+else
+
+  # --- 10a. GitHub -------------------------------------------------------
+  if gh auth status --hostname github.com >/dev/null 2>&1; then
+    info "gh: already signed in as $(gh api user --jq .login 2>/dev/null || echo '?')"
+  else
+    cat <<'GH_EOF'
+
+    gh will print a one-time code. On your laptop, open
+
+        https://github.com/login/device
+
+    paste the code, approve, and gh finishes on its own. Nothing is typed back
+    into this terminal.
+
+GH_EOF
+    # GH_BROWSER=true makes the browser-open step a no-op. Without it gh tries
+    # to launch a browser on this headless box — sometimes a terminal browser,
+    # which makes the device flow look hung while it is really just polling.
+    GH_BROWSER=true gh auth login \
+      --hostname github.com --git-protocol https --web \
+      || die "gh auth login did not complete. Re-run the script when ready; it is idempotent."
+    gh auth status --hostname github.com >/dev/null 2>&1 \
+      || die "gh reports no credentials after login"
+    info "gh: signed in as $(gh api user --jq .login 2>/dev/null || echo '?')"
+  fi
+
+  # --- 10b. Claude Code --------------------------------------------------
+  # Note: Claude Code has no device-code flow. `claude` runs a browser OAuth
+  # round trip against a localhost callback; over SSH that callback is usually
+  # unreachable, so the browser shows a code you paste back at the CLI's
+  # "Paste code here if prompted" prompt. That is the paste step here.
+  #   https://code.claude.com/docs/en/authentication
+  if [[ -s "$CLAUDE_CREDS" ]]; then
+    info "claude: credentials already present ($CLAUDE_CREDS)"
+  elif [[ "$CLAUDE_AUTH" == "token" ]]; then
+    cat <<'TOKEN_EOF'
+
+    `claude setup-token` will print a URL. Approve it in a browser on your
+    laptop and it prints a one-year OAuth token. It saves that token nowhere,
+    so paste it back here and this script will store it for you.
+
+    Caveat: a setup-token credential can only make model requests. It cannot
+    open Remote Control sessions or pull claude.ai connectors. Use
+    CLAUDE_AUTH=login if you need either.
+
+TOKEN_EOF
+    claude setup-token || die "claude setup-token failed"
+    printf '\n    Paste the token (input hidden), or Enter to skip: '
+    IFS= read -rs CC_TOKEN || true
+    printf '\n'
+    if [[ -n "${CC_TOKEN:-}" ]]; then
+      mkdir -p "$HOME/.config"
+      ( umask 077; printf 'export CLAUDE_CODE_OAUTH_TOKEN=%q\n' "$CC_TOKEN" \
+          >"$HOME/.config/claude-code.env" )
+      if ! grep -qs 'claude-code.env' "$HOME/.bashrc"; then
+        {
+          echo ''
+          echo '# added by aviggiano/setup'
+          echo '[ -r "$HOME/.config/claude-code.env" ] && . "$HOME/.config/claude-code.env"'
+        } >>"$HOME/.bashrc"
+      fi
+      unset CC_TOKEN
+      info "token written to ~/.config/claude-code.env (mode 600) and sourced from ~/.bashrc"
+      warn "that file is a year-long credential in plaintext — treat the box accordingly"
+    else
+      warn "no token stored; export CLAUDE_CODE_OAUTH_TOKEN yourself before using claude"
+    fi
+  else
+    cat <<'CLAUDE_EOF'
+
+    Claude Code will start and open its login flow. On your laptop, press `c`
+    to copy the login URL if no browser opens, sign in, and if the browser
+    shows a code rather than returning to the terminal, paste that code at the
+    "Paste code here if prompted" prompt.
+
+    When it says "Login successful", type /exit to hand this terminal back.
+
+CLAUDE_EOF
+    claude || warn "claude exited non-zero"
+    [[ -s "$CLAUDE_CREDS" ]] \
+      || die "no credentials at $CLAUDE_CREDS — login did not complete. Re-run the script."
+    info "claude: signed in (credentials at $CLAUDE_CREDS)"
+  fi
+fi
+
+# ---------------------------------------------------------------------------
+# 11. Summary
 # ---------------------------------------------------------------------------
 log "Done"
 
 cat <<SUMMARY
-    gh          $(gh --version | head -1)
+    gh          $(gh --version | head -1)  ($(gh auth status --hostname github.com >/dev/null 2>&1 && echo 'signed in' || echo 'NOT signed in'))
     codex       $(codex --version 2>&1 | head -1)
+    claude      $(claude --version 2>&1 | head -1)  ($([[ -s "$CLAUDE_CREDS" ]] && echo 'signed in' || echo 'NOT signed in'))
     codex-lb    $(uv tool list | grep '^codex-lb ' | awk '{print $2}')  ($(systemctl --user is-active codex-lb.service))
     app-server  $(codex app-server daemon version 2>/dev/null | (jq -r '.status // "unknown"' 2>/dev/null || cat))
 
@@ -414,13 +588,10 @@ cat <<SUMMARY
            http://127.0.0.1:${CODEX_LB_PORT}
        Set a dashboard password (and TOTP) there before exposing the port.
 
-    2. Authenticate the GitHub CLI, if you have not already:
-           gh auth login
-
-    3. Pair the Codex app with this machine (prints a short-lived code):
+    2. Pair the Codex app with this machine (prints a short-lived code):
            codex remote-control pair
 
-    4. Verify Codex is routing through codex-lb:
+    3. Verify Codex is routing through codex-lb:
            codex doctor
            codex exec 'say hi'
 
@@ -434,6 +605,17 @@ cat <<SUMMARY
        codex app-server daemon restart
        tail -f ~/.codex/app-server-control/app-server.log
 
-    Note: 'codex' and 'uv' live in ~/.local/bin — run 'exec \$SHELL -l' or open a
-    new shell if this was a first-time install.
+    Note: 'codex', 'claude' and 'uv' live in ~/.local/bin — run 'exec \$SHELL -l'
+    or open a new shell if this was a first-time install.
 SUMMARY
+
+# A kernel or libc upgrade needs a reboot to take effect. Say so plainly rather
+# than letting it surface later as a surprise disconnect.
+if [[ -f /var/run/reboot-required ]]; then
+  warn "reboot required to finish applying upgrades"
+  if [[ -s /var/run/reboot-required.pkgs ]]; then
+    info "triggered by: $(sort -u /var/run/reboot-required.pkgs | tr '\n' ' ')"
+  fi
+  info "running kernel: $(uname -r)"
+  info "reboot when convenient; codex-lb comes back on its own (lingering is enabled)"
+fi
