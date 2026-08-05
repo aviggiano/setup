@@ -341,6 +341,13 @@ Restart=always
 RestartSec=5
 # SQLite + alembic migrations need room to finish on first boot
 TimeoutStartSec=120
+# codex-lb opens an aiosqlite connection (2 fds: store.db + store.db-wal) per
+# pooled session and does not always release them. Under the default 1024 soft
+# limit the process wedges after a few days: every query fails with
+# "sqlite3.OperationalError: unable to open database file" and the port stops
+# accepting connections, while systemd still reports the unit as active.
+# Headroom turns a hard wedge into something the restart below can outrun.
+LimitNOFILE=65536
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=codex-lb
@@ -369,8 +376,11 @@ info "service enabled and (re)started"
 # ---------------------------------------------------------------------------
 log "Waiting for codex-lb to become healthy"
 
+# Startup blocks on an alembic revision check against store.db, which grows with
+# request history — a ~325MB store took ~120s to reach "Application startup
+# complete", right at the edge of the old 60x2s budget. Allow ~5min.
 LB_READY=0
-for _ in $(seq 1 60); do
+for _ in $(seq 1 150); do
   if curl -fsS -o /dev/null --max-time 3 "http://127.0.0.1:${CODEX_LB_PORT}/"; then
     LB_READY=1
     break
@@ -381,7 +391,7 @@ done
 if [[ "$LB_READY" == "1" ]]; then
   info "responding on http://127.0.0.1:${CODEX_LB_PORT}/"
 else
-  warn "no response after ~120s. Check: journalctl --user -u codex-lb -n 50 --no-pager"
+  warn "no response after ~5min. Check: journalctl --user -u codex-lb -n 50 --no-pager"
 fi
 
 # ---------------------------------------------------------------------------
