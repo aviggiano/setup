@@ -2,6 +2,7 @@
 #
 # setup.sh — provision a Debian/Ubuntu box with:
 #   * system packages brought up to date (apt update && apt full-upgrade)
+#   * Git author identity       configured globally
 #   * GitHub CLI (gh)          via GitHub's official apt repository
 #   * OpenAI Codex CLI         via https://chatgpt.com/codex/install.sh
 #   * codex-lb                 via `uv tool install` + a systemd --user service
@@ -199,6 +200,12 @@ fi
   ca-certificates curl wget git gnupg jq python3 unzip bubblewrap
 
 "${APT[@]}" autoremove -y
+
+log "Configuring Git identity"
+
+git config --global user.name "Antonio Viggiano"
+git config --global user.email "agfviggiano@gmail.com"
+info "$(git config --global user.name) <$(git config --global user.email)>"
 
 # ---------------------------------------------------------------------------
 # 2. Make ~/.local/bin permanently available on PATH
