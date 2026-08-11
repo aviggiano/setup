@@ -4,12 +4,13 @@
 #   * system packages brought up to date (apt update && apt full-upgrade)
 #   * Git author identity       configured globally
 #   * GitHub CLI (gh)          via GitHub's official apt repository
+#   * 1Password CLI (op)       via 1Password's official apt repository
 #   * OpenAI Codex CLI         via https://chatgpt.com/codex/install.sh
 #   * codex-lb                 via `uv tool install` + a systemd --user service
 #   * ~/.codex/config.toml     pointed at the local codex-lb endpoint
 #   * Codex app-server daemon  bootstrapped with remote control enabled
 #   * Claude Code              via https://claude.ai/install.sh
-#   * sign-in                  gh, then Claude Code — interactive, last, in series
+#   * sign-in                  gh, op, then Claude Code — interactive, last, in series
 #
 # Idempotent: safe to re-run to upgrade an existing install.
 #
@@ -30,6 +31,8 @@
 #   CODEX_LB_PORT     port codex-lb listens on            (default: 2455)
 #   SKIP_APT_UPGRADE  set to 1 to skip the apt upgrade step
 #   CLAUDE_AUTH       login (browser OAuth, default) | token (setup-token) | skip
+#   OP_AUTH           service-account (default) | skip
+#   OP_SERVICE_ACCOUNT_TOKEN  pass the token in instead of being prompted for it
 #
 # Steps 1-9 are unattended. Step 10 signs you in and needs a terminal; with no
 # TTY it is skipped and the commands are printed instead, so the provisioning
@@ -54,6 +57,19 @@ case "$CLAUDE_AUTH" in
   login | token | skip) ;;
   *) printf 'CLAUDE_AUTH must be login, token or skip (got: %s)\n' "$CLAUDE_AUTH" >&2; exit 1 ;;
 esac
+# service-account = store an OP_SERVICE_ACCOUNT_TOKEN for headless, unattended use
+# skip            = install the CLI only, leave auth to you
+#
+# `op signin` (the interactive account flow) is deliberately not an option here:
+# on Linux it wants either the 1Password desktop app over its local socket or an
+# account password typed at a terminal on every new shell. Neither survives cron,
+# `ssh host 'cmd'`, or an agent running unattended. A service account token is a
+# single env var, scoped to the vaults you grant it.
+OP_AUTH="${OP_AUTH:-service-account}"
+case "$OP_AUTH" in
+  service-account | skip) ;;
+  *) printf 'OP_AUTH must be service-account or skip (got: %s)\n' "$OP_AUTH" >&2; exit 1 ;;
+esac
 
 # Non-login shells (cron, `ssh host 'cmd'`, `docker exec`) often do not export
 # USER, and `set -u` turns that into a hard failure. HOME is set by PAM/sshd in
@@ -69,6 +85,21 @@ log()  { printf '\n\033[1;34m==>\033[0m \033[1m%s\033[0m\n' "$*"; }
 info() { printf '    %s\n' "$*"; }
 warn() { printf '\033[1;33m    warning:\033[0m %s\n' "$*" >&2; }
 die()  { printf '\033[1;31m==> error:\033[0m %s\n' "$*" >&2; exit 1; }
+
+# Have future interactive shells source an env file. Takes the path with $HOME
+# left *unexpanded* — 'source_from_bashrc "\$HOME/.config/x.env"' — so the line
+# in ~/.bashrc stays portable and matches what earlier runs of this script
+# wrote. Idempotent: the grep keeps a re-run from stacking duplicate lines.
+source_from_bashrc() {
+  local file="$1"
+  if ! grep -qsF -- "$file" "$HOME/.bashrc"; then
+    {
+      echo ''
+      echo '# added by aviggiano/setup'
+      echo "[ -r \"$file\" ] && . \"$file\""
+    } >>"$HOME/.bashrc"
+  fi
+}
 
 TMPWORK="$(mktemp -d "${TMPDIR:-/tmp}/setup.XXXXXX")"
 trap 'rm -rf "$TMPWORK"' EXIT
@@ -253,6 +284,59 @@ if [[ -f "$LOCAL_BIN/gh" && ! -L "$LOCAL_BIN/gh" ]]; then
   mv -f "$LOCAL_BIN/gh" "$LOCAL_BIN/gh.pre-apt.bak"
   warn "moved standalone $LOCAL_BIN/gh aside (now apt-managed at $(command -v gh || echo /usr/bin/gh))"
 fi
+
+# ---------------------------------------------------------------------------
+# 3b. 1Password CLI — official apt repository, so `apt upgrade` keeps it current
+# ---------------------------------------------------------------------------
+# https://developer.1password.com/docs/cli/get-started/#install
+#
+# Two verification layers, both from 1Password's docs:
+#   * signed-by keyring — apt checks the repository index signature
+#   * debsig policy     — dpkg checks the signature embedded in the .deb itself
+# The debsig half is what the extra /etc/debsig + /usr/share/debsig paths are
+# for. It is optional (dpkg does not verify debsig unless a policy exists), but
+# it is cheap and it is what upstream recommends.
+log "Installing 1Password CLI (op)"
+
+OP_KEYRING=/usr/share/keyrings/1password-archive-keyring.gpg
+OP_LIST=/etc/apt/sources.list.d/1password.list
+OP_ARCH=$(dpkg --print-architecture)
+# 1Password signs its packages with this key; the fingerprint tail names the
+# debsig policy directory.
+OP_DEBSIG_ID=AC2D62742012EA22
+
+if [[ ! -s "$OP_KEYRING" ]]; then
+  wget -qO- https://downloads.1password.com/linux/keys/1password.asc \
+    | "${SUDO[@]}" gpg --dearmor --yes --output "$OP_KEYRING"
+  "${SUDO[@]}" chmod go+r "$OP_KEYRING"
+  info "installed apt keyring"
+fi
+
+OP_REPO="deb [arch=$OP_ARCH signed-by=$OP_KEYRING] https://downloads.1password.com/linux/debian/$OP_ARCH stable main"
+if [[ ! -f "$OP_LIST" ]] || ! grep -qF "$OP_REPO" "$OP_LIST"; then
+  echo "$OP_REPO" | "${SUDO[@]}" tee "$OP_LIST" >/dev/null
+  "${APT[@]}" update -y
+  info "added downloads.1password.com apt repository"
+fi
+
+OP_POLICY="/etc/debsig/policies/$OP_DEBSIG_ID/1password.pol"
+if [[ ! -s "$OP_POLICY" ]]; then
+  "${SUDO[@]}" mkdir -p "$(dirname "$OP_POLICY")"
+  wget -qO- https://downloads.1password.com/linux/debian/debsig/1password.pol \
+    | "${SUDO[@]}" tee "$OP_POLICY" >/dev/null
+  info "installed debsig policy"
+fi
+
+OP_DEBSIG_KEYRING="/usr/share/debsig/keyrings/$OP_DEBSIG_ID/debsig.gpg"
+if [[ ! -s "$OP_DEBSIG_KEYRING" ]]; then
+  "${SUDO[@]}" mkdir -p "$(dirname "$OP_DEBSIG_KEYRING")"
+  wget -qO- https://downloads.1password.com/linux/keys/1password.asc \
+    | "${SUDO[@]}" gpg --dearmor --yes --output "$OP_DEBSIG_KEYRING"
+  info "installed debsig keyring"
+fi
+
+"${APT[@]}" install -y 1password-cli
+info "op $(op --version 2>&1 | head -1)"
 
 # ---------------------------------------------------------------------------
 # 4. Codex CLI
@@ -520,16 +604,17 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 10. Interactive sign-in (gh, then Claude Code) — in series, last
+# 10. Interactive sign-in (gh, op, then Claude Code) — in series, last
 # ---------------------------------------------------------------------------
-# Everything above is unattended. These two are not: each prints a code or URL,
-# waits for you to finish in a browser elsewhere, and must not overlap with the
-# other or you end up pasting the wrong code into the wrong page. So they run
-# one at a time, at the very end, and a failure stops the script rather than
-# falling through to a summary that claims success.
+# Everything above is unattended. These are not: each prints a code or URL or
+# waits on a paste, and they must not overlap or you end up putting the wrong
+# code into the wrong page. So they run one at a time, at the very end, and a
+# failure stops the script rather than falling through to a summary that claims
+# success.
 log "Interactive sign-in"
 
 CLAUDE_CREDS="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/.credentials.json"
+OP_ENV="$HOME/.config/1password.env"
 
 if [[ "$CLAUDE_AUTH" == "skip" ]] || [[ ! -t 0 ]] || [[ ! -t 1 ]]; then
   if [[ "$CLAUDE_AUTH" == "skip" ]]; then
@@ -540,6 +625,10 @@ if [[ "$CLAUDE_AUTH" == "skip" ]] || [[ ! -t 0 ]] || [[ ! -t 1 ]]; then
   info "run these yourself, one at a time:"
   info "    GH_BROWSER=true gh auth login --hostname github.com --git-protocol https --web"
   info "    claude          # complete /login, then /exit"
+  info "    # 1Password: create a service account at"
+  info "    #   https://my.1password.com/developer-tools/infrastructure-secrets/serviceaccount/"
+  info "    # then, with the token in \$T:"
+  info "    ( umask 077; printf 'export OP_SERVICE_ACCOUNT_TOKEN=%q\\n' \"\$T\" >$OP_ENV )"
 else
 
   # --- 10a. GitHub -------------------------------------------------------
@@ -567,7 +656,58 @@ GH_EOF
     info "gh: signed in as $(gh api user --jq .login 2>/dev/null || echo '?')"
   fi
 
-  # --- 10b. Claude Code --------------------------------------------------
+  # --- 10b. 1Password ----------------------------------------------------
+  # A service account token is the only 1Password credential that works on a
+  # headless box without a human in the loop: no desktop app socket, no password
+  # re-entry per shell. It carries whatever vault permissions you granted it at
+  # creation time, so grant read-only on the narrowest set of vaults that works.
+  #   https://developer.1password.com/docs/service-accounts/get-started/
+  if [[ "$OP_AUTH" == "skip" ]]; then
+    info "op: OP_AUTH=skip — CLI installed, not authenticated"
+  elif [[ -s "$OP_ENV" ]]; then
+    info "op: token already present ($OP_ENV)"
+  else
+    if [[ -z "${OP_SERVICE_ACCOUNT_TOKEN:-}" ]]; then
+      cat <<'OP_EOF'
+
+    1Password needs a service account token. On your laptop:
+
+        1. https://my.1password.com/developer-tools/infrastructure-secrets/serviceaccount/
+        2. Create Service Account, name it after this box
+        3. Grant it read access to the vault(s) this box should see — nothing more
+        4. Copy the token (ops_...); 1Password shows it exactly once
+
+OP_EOF
+      printf '    Paste the token (input hidden), or Enter to skip: '
+      IFS= read -rs OP_TOKEN || true
+      printf '\n'
+    else
+      OP_TOKEN="$OP_SERVICE_ACCOUNT_TOKEN"
+      info "using OP_SERVICE_ACCOUNT_TOKEN from the environment"
+    fi
+
+    if [[ -n "${OP_TOKEN:-}" ]]; then
+      # Verify before storing, so a typo fails here rather than at first use.
+      if OP_SERVICE_ACCOUNT_TOKEN="$OP_TOKEN" op whoami >/dev/null 2>&1; then
+        mkdir -p "$HOME/.config"
+        ( umask 077; printf 'export OP_SERVICE_ACCOUNT_TOKEN=%q\n' "$OP_TOKEN" >"$OP_ENV" )
+        source_from_bashrc '$HOME/.config/1password.env'
+        export OP_SERVICE_ACCOUNT_TOKEN="$OP_TOKEN"
+        info "op: token written to $OP_ENV (mode 600) and sourced from ~/.bashrc"
+        info "op: vaults visible — $(op vault list --format=json 2>/dev/null \
+              | jq -r '[.[].name] | join(", ")' 2>/dev/null || echo '?')"
+        warn "that file is a plaintext credential for those vaults — treat the box accordingly"
+      else
+        unset OP_TOKEN
+        die "op rejected that token (op whoami failed). Nothing was written; re-run when you have a valid one."
+      fi
+      unset OP_TOKEN
+    else
+      warn "no token stored; export OP_SERVICE_ACCOUNT_TOKEN yourself before using op"
+    fi
+  fi
+
+  # --- 10c. Claude Code --------------------------------------------------
   # Note: Claude Code has no device-code flow. `claude` runs a browser OAuth
   # round trip against a localhost callback; over SSH that callback is usually
   # unreachable, so the browser shows a code you paste back at the CLI's
@@ -595,13 +735,7 @@ TOKEN_EOF
       mkdir -p "$HOME/.config"
       ( umask 077; printf 'export CLAUDE_CODE_OAUTH_TOKEN=%q\n' "$CC_TOKEN" \
           >"$HOME/.config/claude-code.env" )
-      if ! grep -qs 'claude-code.env' "$HOME/.bashrc"; then
-        {
-          echo ''
-          echo '# added by aviggiano/setup'
-          echo '[ -r "$HOME/.config/claude-code.env" ] && . "$HOME/.config/claude-code.env"'
-        } >>"$HOME/.bashrc"
-      fi
+      source_from_bashrc '$HOME/.config/claude-code.env'
       unset CC_TOKEN
       info "token written to ~/.config/claude-code.env (mode 600) and sourced from ~/.bashrc"
       warn "that file is a year-long credential in plaintext — treat the box accordingly"
@@ -633,6 +767,7 @@ log "Done"
 
 cat <<SUMMARY
     gh          $(gh --version | head -1)  ($(gh auth status --hostname github.com >/dev/null 2>&1 && echo 'signed in' || echo 'NOT signed in'))
+    op          $(op --version 2>&1 | head -1)  ($(op whoami >/dev/null 2>&1 && echo 'authenticated' || echo 'NOT authenticated'))
     codex       $(codex --version 2>&1 | head -1)
     claude      $(claude --version 2>&1 | head -1)  ($([[ -s "$CLAUDE_CREDS" ]] && echo 'signed in' || echo 'NOT signed in'))
     codex-lb    $(uv tool list | grep '^codex-lb ' | awk '{print $2}')  ($(systemctl --user is-active codex-lb.service))
