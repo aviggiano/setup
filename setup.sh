@@ -626,7 +626,7 @@ if [[ "$CLAUDE_AUTH" == "skip" ]] || [[ ! -t 0 ]] || [[ ! -t 1 ]]; then
   info "    GH_BROWSER=true gh auth login --hostname github.com --git-protocol https --web"
   info "    claude          # complete /login, then /exit"
   info "    # 1Password: create a service account at"
-  info "    #   https://my.1password.com/developer-tools/infrastructure-secrets/serviceaccount/"
+  info "    #   https://<your-account>.1password.com/developer-tools/infrastructure-secrets/serviceaccount/"
   info "    # then, with the token in \$T:"
   info "    ( umask 077; printf 'export OP_SERVICE_ACCOUNT_TOKEN=%q\\n' \"\$T\" >$OP_ENV )"
 else
@@ -659,8 +659,17 @@ GH_EOF
   # --- 10b. 1Password ----------------------------------------------------
   # A service account token is the only 1Password credential that works on a
   # headless box without a human in the loop: no desktop app socket, no password
-  # re-entry per shell. It carries whatever vault permissions you granted it at
-  # creation time, so grant read-only on the narrowest set of vaults that works.
+  # re-entry per shell.
+  #
+  # Three things to know before creating one:
+  #   * Its vault access is IMMUTABLE. Adding a vault later means creating a new
+  #     service account and re-issuing the token, so scope it to every vault this
+  #     box will need — read-only, but not narrower than the job.
+  #   * It can never reach your Private/Personal/Employee vault. Anything this
+  #     box needs has to live in a shared vault.
+  #   * On a Teams/Business tenant only owners and admins can create service
+  #     accounts by default; a member needs the right granted under
+  #     Developer > Permissions > Service Account, or an admin creates it.
   #   https://developer.1password.com/docs/service-accounts/get-started/
   if [[ "$OP_AUTH" == "skip" ]]; then
     info "op: OP_AUTH=skip — CLI installed, not authenticated"
@@ -672,9 +681,15 @@ GH_EOF
 
     1Password needs a service account token. On your laptop:
 
-        1. https://my.1password.com/developer-tools/infrastructure-secrets/serviceaccount/
+        1. https://<your-account>.1password.com/developer-tools/infrastructure-secrets/serviceaccount/
+           (your own sign-in subdomain — my.1password.com only works for
+           personal/family accounts, and on a company tenant it will just
+           redirect you to your home page. No Developer section at all means
+           you are not an owner/admin; ask one to grant the permission.)
         2. Create Service Account, name it after this box
-        3. Grant it read access to the vault(s) this box should see — nothing more
+        3. Grant it read access to every shared vault this box will need. Not
+           your Private vault — service accounts cannot be given access to it.
+           Vault access cannot be changed afterwards.
         4. Copy the token (ops_...); 1Password shows it exactly once
 
 OP_EOF
