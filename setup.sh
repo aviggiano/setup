@@ -30,11 +30,18 @@
 #   CODEX_LB_PORT     port codex-lb listens on            (default: 2455)
 #   SKIP_APT_UPGRADE  set to 1 to skip the apt upgrade step
 #   CLAUDE_AUTH       login (browser OAuth, default) | token (setup-token) | skip
+#   OP_AUTH           auto (default) | prompt | skip
+#   OP_SERVICE_ACCOUNT_TOKEN
+#                     1Password service account token; when set it is stored
+#                     without prompting, which is how an automated provisioner
+#                     should pass it.
 #
-# Steps 1-9 are unattended. Step 10 signs you in and needs a terminal; with no
-# TTY it is skipped and the commands are printed instead, so the provisioning
-# still completes. Run it under tmux — an apt upgrade can restart the service
-# carrying your SSH session.
+# Steps 1-9 are unattended. Step 10 signs you in and needs a *terminal* — but
+# not a terminal on stdin. `curl | bash` makes this script stdin, so sign-in
+# reads from /dev/tty instead and still works. With no controlling terminal at
+# all (cron, `ssh host 'cmd'`) it is skipped and the commands are printed, so
+# provisioning still completes. Run it under tmux — an apt upgrade can restart
+# the service carrying your SSH session.
 #
 set -euo pipefail
 
@@ -54,6 +61,14 @@ case "$CLAUDE_AUTH" in
   login | token | skip) ;;
   *) printf 'CLAUDE_AUTH must be login, token or skip (got: %s)\n' "$CLAUDE_AUTH" >&2; exit 1 ;;
 esac
+# auto   = use OP_SERVICE_ACCOUNT_TOKEN if set, else prompt when a terminal exists
+# prompt = always ask, even if the variable is already set
+# skip   = leave 1Password alone
+OP_AUTH="${OP_AUTH:-auto}"
+case "$OP_AUTH" in
+  auto | prompt | skip) ;;
+  *) printf 'OP_AUTH must be auto, prompt or skip (got: %s)\n' "$OP_AUTH" >&2; exit 1 ;;
+esac
 
 # Non-login shells (cron, `ssh host 'cmd'`, `docker exec`) often do not export
 # USER, and `set -u` turns that into a hard failure. HOME is set by PAM/sshd in
@@ -64,6 +79,7 @@ LOCAL_BIN="$HOME/.local/bin"
 CODEX_HOME="$HOME/.codex"
 UNIT_DIR="$HOME/.config/systemd/user"
 UNIT="$UNIT_DIR/codex-lb.service"
+OP_ENV="$HOME/.config/op.env"
 
 log()  { printf '\n\033[1;34m==>\033[0m \033[1m%s\033[0m\n' "$*"; }
 info() { printf '    %s\n' "$*"; }
@@ -72,6 +88,64 @@ die()  { printf '\033[1;31m==> error:\033[0m %s\n' "$*" >&2; exit 1; }
 
 TMPWORK="$(mktemp -d "${TMPDIR:-/tmp}/setup.XXXXXX")"
 trap 'rm -rf "$TMPWORK"' EXIT
+
+# Append a block to ~/.bashrc exactly once, keyed on a string that must appear
+# in it. Every caller here was open-coding the same grep/heredoc pair.
+bashrc_once() {
+  local marker="$1"
+  # -F: the markers are filenames, and an unescaped '.' would match anything.
+  grep -qsF "$marker" "$HOME/.bashrc" && return 0
+  { echo ''; echo '# added by aviggiano/setup'; cat; } >>"$HOME/.bashrc"
+}
+
+# Store the 1Password service account token. Mode 600 and sourced from
+# ~/.bashrc, matching how the Claude Code token is handled in step 10b.
+write_op_env() {
+  mkdir -p "$HOME/.config"
+  ( umask 077; printf 'export OP_SERVICE_ACCOUNT_TOKEN=%q\n' "$1" >"$OP_ENV" )
+  bashrc_once 'op.env' <<'OP_BASHRC'
+# The service account token in op.env is the only secret stored on this machine.
+# Every other credential lives in 1Password and is fetched on demand.
+#
+# Discover what this token can reach:
+#   op vault list                          # vaults granted to this service account
+#   op item list --vault <vault>           # credentials available in one
+#   op item get <item> --vault <vault>     # its fields (--vault is REQUIRED for
+#                                          # service accounts; without it op errors)
+#
+# Use one without storing it:
+#   export <VAR>=$(op read "op://<vault>/<item>/<field>")
+#   op run --env-file=<file> -- <cmd>      # file holds op:// references, not values
+#
+# Reference syntax: https://developer.1password.com/docs/cli/secret-reference-syntax/
+[ -r "$HOME/.config/op.env" ] && . "$HOME/.config/op.env"
+OP_BASHRC
+}
+
+# Read a service account token from the terminal.
+#
+# No asterisk echo: that needs a character-at-a-time loop, which throws away the
+# terminal's own line editing, so a mistyped 800-character paste becomes
+# unfixable. `read -s` keeps backspace and ctrl-U working; the fingerprint below
+# is what actually confirms the paste landed. Reads /dev/tty, not stdin, so this
+# survives `curl | bash`.
+prompt_op_token() {
+  local t ans
+  while :; do
+    printf '\n    Paste the 1Password service account token (input hidden), or Enter to skip: ' >/dev/tty
+    IFS= read -rs t </dev/tty || true
+    printf '\n' >/dev/tty
+    [[ -z "$t" ]] && return 1
+    if [[ "$t" != ops_* ]]; then
+      warn "a service account token starts with 'ops_' — that looks like the wrong entry"
+      continue
+    fi
+    printf '    %d chars, %s...%s — correct? [y/N] ' "${#t}" "${t:0:8}" "${t: -4}" >/dev/tty
+    IFS= read -r ans </dev/tty || true
+    printf '\n' >/dev/tty
+    if [[ "$ans" == [yY]* ]]; then OP_TOKEN="$t"; return 0; fi
+  done
+}
 
 # Run a third-party install script safely.
 #
@@ -160,12 +234,19 @@ if [[ -n "${SSH_CONNECTION:-}" && -z "${TMUX:-}" && -z "${STY:-}" ]]; then
   [[ -t 1 ]] && sleep 5
 fi
 
-# Piped into bash, this script *is* stdin, so step 10 cannot read a pasted code
-# and is skipped. Say so now rather than at the end of a 20-minute run.
-if [[ ! -t 0 ]] && [[ ! -f "${BASH_SOURCE[0]:-}" ]]; then
-  warn "this script is being read from stdin (curl | bash)."
-  warn "provisioning works, but sign-in needs a terminal and will be skipped."
-  warn "to sign in during the run: save it to a file and execute that instead."
+# Whether we can talk to the user is decided by the *controlling terminal*, not
+# by stdin. Under `curl | bash` this script is stdin, so `-t 0` is false even
+# with someone sitting right there — but /dev/tty is still the real terminal and
+# still readable. Gate step 10 on that, and `curl | bash` keeps its sign-in.
+#
+# The cases with genuinely no terminal — cron, `ssh host 'cmd'`, a container
+# without a pty — have no /dev/tty to open, and there step 10 is skipped.
+if [[ -r /dev/tty && -w /dev/tty ]]; then
+  HAVE_TTY=1
+else
+  HAVE_TTY=0
+  warn "no controlling terminal — sign-in will be skipped (provisioning is unaffected)."
+  warn "to sign in during the run, invoke this from an interactive shell."
 fi
 
 # systemctl --user needs a running user manager, which exists in a normal login
@@ -253,6 +334,35 @@ if [[ -f "$LOCAL_BIN/gh" && ! -L "$LOCAL_BIN/gh" ]]; then
   mv -f "$LOCAL_BIN/gh" "$LOCAL_BIN/gh.pre-apt.bak"
   warn "moved standalone $LOCAL_BIN/gh aside (now apt-managed at $(command -v gh || echo /usr/bin/gh))"
 fi
+
+# ---------------------------------------------------------------------------
+# 3b. 1Password CLI — official apt repository, same reasoning as gh
+# ---------------------------------------------------------------------------
+# Only the binary is installed here. Storing the token is interactive and lives
+# in step 10c; installing needs no terminal, so it belongs in the unattended run.
+log "Installing 1Password CLI (op)"
+
+OP_KEYRING=/usr/share/keyrings/1password-archive-keyring.gpg
+OP_LIST=/etc/apt/sources.list.d/1password.list
+
+if [[ ! -s "$OP_KEYRING" ]]; then
+  curl -fsSL https://downloads.1password.com/linux/keys/1password.asc \
+    | "${SUDO[@]}" gpg --dearmor --yes -o "$OP_KEYRING" \
+    || die "could not install the 1Password apt keyring"
+  "${SUDO[@]}" chmod go+r "$OP_KEYRING"
+  info "installed apt keyring"
+fi
+
+OP_ARCH="$(dpkg --print-architecture)"
+OP_REPO="deb [arch=$OP_ARCH signed-by=$OP_KEYRING] https://downloads.1password.com/linux/debian/$OP_ARCH stable main"
+if [[ ! -f "$OP_LIST" ]] || ! grep -qF "$OP_REPO" "$OP_LIST"; then
+  echo "$OP_REPO" | "${SUDO[@]}" tee "$OP_LIST" >/dev/null
+  "${APT[@]}" update -y
+  info "added downloads.1password.com apt repository"
+fi
+
+"${APT[@]}" install -y 1password-cli
+info "$(op --version 2>&1 | head -1)"
 
 # ---------------------------------------------------------------------------
 # 4. Codex CLI
@@ -531,7 +641,31 @@ log "Interactive sign-in"
 
 CLAUDE_CREDS="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/.credentials.json"
 
-if [[ "$CLAUDE_AUTH" == "skip" ]] || [[ ! -t 0 ]] || [[ ! -t 1 ]]; then
+# --- 10c. 1Password service account ---------------------------------------
+# Runs before the terminal gate on purpose: unlike gh and Claude Code this has
+# no browser round trip, and when a provisioner has already put the token in the
+# environment it needs no terminal at all. That is the path that makes an
+# unattended `OP_SERVICE_ACCOUNT_TOKEN=... bash setup.sh` work end to end.
+if [[ "$OP_AUTH" == "skip" ]]; then
+  info "op: OP_AUTH=skip — not configuring 1Password"
+elif [[ -s "$OP_ENV" && "$OP_AUTH" != "prompt" ]]; then
+  info "op: token already present ($OP_ENV)"
+elif [[ -n "${OP_SERVICE_ACCOUNT_TOKEN:-}" && "$OP_AUTH" != "prompt" ]]; then
+  write_op_env "$OP_SERVICE_ACCOUNT_TOKEN"
+  info "op: token taken from the environment, stored in $OP_ENV (mode 600)"
+elif [[ $HAVE_TTY -eq 1 ]]; then
+  if prompt_op_token; then
+    write_op_env "$OP_TOKEN"
+    unset OP_TOKEN
+    info "op: token stored in $OP_ENV (mode 600) and sourced from ~/.bashrc"
+  else
+    warn "no token stored; export OP_SERVICE_ACCOUNT_TOKEN yourself before using op"
+  fi
+else
+  info "op: no token supplied — set OP_SERVICE_ACCOUNT_TOKEN, or re-run with a terminal"
+fi
+
+if [[ "$CLAUDE_AUTH" == "skip" ]] || [[ $HAVE_TTY -eq 0 ]]; then
   if [[ "$CLAUDE_AUTH" == "skip" ]]; then
     info "CLAUDE_AUTH=skip — not signing in"
   else
@@ -559,8 +693,12 @@ GH_EOF
     # GH_BROWSER=true makes the browser-open step a no-op. Without it gh tries
     # to launch a browser on this headless box — sometimes a terminal browser,
     # which makes the device flow look hung while it is really just polling.
+    #
+    # </dev/tty for the same reason run_installer uses </dev/null: under
+    # `curl | bash` our stdin is this script's source, and gh's prompts would
+    # otherwise eat shell text bash has not parsed yet.
     GH_BROWSER=true gh auth login \
-      --hostname github.com --git-protocol https --web \
+      --hostname github.com --git-protocol https --web </dev/tty \
       || die "gh auth login did not complete. Re-run the script when ready; it is idempotent."
     gh auth status --hostname github.com >/dev/null 2>&1 \
       || die "gh reports no credentials after login"
@@ -587,21 +725,17 @@ GH_EOF
     CLAUDE_AUTH=login if you need either.
 
 TOKEN_EOF
-    claude setup-token || die "claude setup-token failed"
+    claude setup-token </dev/tty || die "claude setup-token failed"
     printf '\n    Paste the token (input hidden), or Enter to skip: '
-    IFS= read -rs CC_TOKEN || true
+    IFS= read -rs CC_TOKEN </dev/tty || true
     printf '\n'
     if [[ -n "${CC_TOKEN:-}" ]]; then
       mkdir -p "$HOME/.config"
       ( umask 077; printf 'export CLAUDE_CODE_OAUTH_TOKEN=%q\n' "$CC_TOKEN" \
           >"$HOME/.config/claude-code.env" )
-      if ! grep -qs 'claude-code.env' "$HOME/.bashrc"; then
-        {
-          echo ''
-          echo '# added by aviggiano/setup'
-          echo '[ -r "$HOME/.config/claude-code.env" ] && . "$HOME/.config/claude-code.env"'
-        } >>"$HOME/.bashrc"
-      fi
+      bashrc_once 'claude-code.env' <<'CC_BASHRC'
+[ -r "$HOME/.config/claude-code.env" ] && . "$HOME/.config/claude-code.env"
+CC_BASHRC
       unset CC_TOKEN
       info "token written to ~/.config/claude-code.env (mode 600) and sourced from ~/.bashrc"
       warn "that file is a year-long credential in plaintext — treat the box accordingly"
@@ -619,7 +753,7 @@ TOKEN_EOF
     When it says "Login successful", type /exit to hand this terminal back.
 
 CLAUDE_EOF
-    claude || warn "claude exited non-zero"
+    claude </dev/tty || warn "claude exited non-zero"
     [[ -s "$CLAUDE_CREDS" ]] \
       || die "no credentials at $CLAUDE_CREDS — login did not complete. Re-run the script."
     info "claude: signed in (credentials at $CLAUDE_CREDS)"
@@ -635,6 +769,7 @@ cat <<SUMMARY
     gh          $(gh --version | head -1)  ($(gh auth status --hostname github.com >/dev/null 2>&1 && echo 'signed in' || echo 'NOT signed in'))
     codex       $(codex --version 2>&1 | head -1)
     claude      $(claude --version 2>&1 | head -1)  ($([[ -s "$CLAUDE_CREDS" ]] && echo 'signed in' || echo 'NOT signed in'))
+    op          $(op --version 2>&1 | head -1)  ($([[ -s "$OP_ENV" ]] && echo 'token stored' || echo 'NO token'))
     codex-lb    $(uv tool list | grep '^codex-lb ' | awk '{print $2}')  ($(systemctl --user is-active codex-lb.service))
     app-server  $(codex app-server daemon version 2>/dev/null | (jq -r '.status // "unknown"' 2>/dev/null || cat))
 
@@ -650,6 +785,12 @@ cat <<SUMMARY
     3. Verify Codex is routing through codex-lb:
            codex doctor
            codex exec 'say hi'
+
+    4. See which credentials this machine can reach (no names are baked in —
+       ask 1Password, so a credential added to the vault later just shows up):
+           op vault list
+           op item list --vault <vault>
+           op read "op://<vault>/<item>/<field>"
 
     Managing the services
     ---------------------
