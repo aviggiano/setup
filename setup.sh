@@ -5,8 +5,9 @@
 #   * Git author identity       configured globally
 #   * GitHub CLI (gh)          via GitHub's official apt repository
 #   * OpenAI Codex CLI         via https://chatgpt.com/codex/install.sh
-#   * codex-lb                 via `uv tool install` + a systemd --user service
-#   * ~/.codex/config.toml     pointed at the local codex-lb endpoint
+#   * codex-lb (opt-in)        via `uv tool install` + a systemd --user service
+#   * ~/.codex/config.toml     model + reasoning effort, and the codex-lb
+#                              provider when codex-lb is enabled
 #   * Codex app-server daemon  bootstrapped with remote control enabled
 #   * Claude Code              via https://claude.ai/install.sh
 #   * sign-in                  gh, then Claude Code — interactive, last, in series
@@ -26,6 +27,8 @@
 # Environment overrides:
 #   CODEX_MODEL       model written to config.toml        (default: gpt-5.6-sol)
 #   CODEX_EFFORT      model_reasoning_effort              (default: xhigh)
+#   CODEX_LB          1 to install codex-lb and route Codex through it
+#                                                         (default: 0)
 #   CODEX_LB_HOST     interface codex-lb binds to         (default: 0.0.0.0)
 #   CODEX_LB_PORT     port codex-lb listens on            (default: 2455)
 #   SKIP_APT_UPGRADE  set to 1 to skip the apt upgrade step
@@ -47,6 +50,17 @@ set -euo pipefail
 
 CODEX_MODEL="${CODEX_MODEL:-gpt-5.6-sol}"
 CODEX_EFFORT="${CODEX_EFFORT:-xhigh}"
+# codex-lb pools several ChatGPT accounts behind a local endpoint. That is a
+# minority setup, and it costs a systemd service, an open port holding account
+# tokens, and a config.toml that no longer works if the service is down — so it
+# is opt-in. With CODEX_LB=0 Codex talks to OpenAI directly under your own
+# login, and nothing below writes a provider or an auth.json.
+CODEX_LB="${CODEX_LB:-0}"
+case "$CODEX_LB" in
+  1 | true | yes) CODEX_LB=1 ;;
+  0 | false | no) CODEX_LB=0 ;;
+  *) printf 'CODEX_LB must be 0 or 1 (got: %s)\n' "$CODEX_LB" >&2; exit 1 ;;
+esac
 # NOTE: 0.0.0.0 exposes the codex-lb dashboard (which holds your ChatGPT
 # account tokens) to every host that can reach this machine. Set a dashboard
 # password + TOTP in the UI, or override with CODEX_LB_HOST=127.0.0.1.
@@ -177,13 +191,17 @@ run_installer() {
 log "Preflight"
 
 [[ "$(uname -s)" == "Linux" ]] || die "this script targets Linux (found $(uname -s))"
-[[ $EUID -ne 0 ]] || die "run as a normal user, not root — codex-lb runs as a systemd --user service"
+[[ $EUID -ne 0 ]] || die "run as a normal user, not root — this installs per-user tools and systemd --user services"
 command -v apt-get >/dev/null || die "apt-get not found; this script targets Debian/Ubuntu"
 command -v sudo >/dev/null    || die "sudo not found; it is required for the apt steps"
 
 info "user      : $USER"
 info "home      : $HOME"
-info "codex-lb  : ${CODEX_LB_HOST}:${CODEX_LB_PORT}"
+if [[ "$CODEX_LB" == "1" ]]; then
+  info "codex-lb  : ${CODEX_LB_HOST}:${CODEX_LB_PORT}"
+else
+  info "codex-lb  : disabled (CODEX_LB=1 to install it)"
+fi
 info "model     : ${CODEX_MODEL} (reasoning effort: ${CODEX_EFFORT})"
 
 # Non-interactive sudo. `sudo -v` prompts, which means it fails under
@@ -412,8 +430,10 @@ if [[ -n "${ANTHROPIC_API_KEY:-}" ]]; then
 fi
 
 # ---------------------------------------------------------------------------
-# 5. uv + codex-lb
+# 5. uv
 # ---------------------------------------------------------------------------
+# Installed unconditionally: codex-lb is the only thing here that needs it, but
+# uv is a general-purpose tool and the summary points at it either way.
 log "Installing uv"
 
 if command -v uv >/dev/null 2>&1; then
@@ -425,24 +445,45 @@ else
 fi
 command -v uv >/dev/null || die "uv not on PATH after install"
 
-log "Installing codex-lb (https://github.com/Soju06/codex-lb)"
+# ---------------------------------------------------------------------------
+# 6. systemd lingering
+# ---------------------------------------------------------------------------
+# Lingering keeps the user manager alive across logout and starts its units at
+# boot without an interactive session. Both long-lived processes this script
+# sets up want it — codex-lb in step 7 and the Codex app-server daemon in step
+# 9 — so it is enabled regardless of CODEX_LB.
+log "Enabling systemd lingering"
 
-if uv tool list 2>/dev/null | grep -q '^codex-lb '; then
-  uv tool upgrade codex-lb
+if ! loginctl show-user "$USER" --property=Linger 2>/dev/null | grep -q 'Linger=yes'; then
+  "${SUDO[@]}" loginctl enable-linger "$USER"
+  info "enabled systemd lingering for $USER"
 else
-  uv tool install codex-lb
+  info "systemd lingering already enabled"
 fi
 
-hash -r
-command -v codex-lb >/dev/null || die "codex-lb not on PATH after install"
-info "installed: $(uv tool list | grep '^codex-lb ')"
-
 # ---------------------------------------------------------------------------
-# 6. codex-lb as a systemd --user service
+# 7. codex-lb — install, service, health check   (opt-in: CODEX_LB=1)
 # ---------------------------------------------------------------------------
-log "Configuring the codex-lb service"
+# Skipping means "do not set it up", not "tear it down": a box that already has
+# codex-lb keeps its service running and its config.toml provider untouched, so
+# an unrelated re-run without CODEX_LB=1 cannot break a working install.
+if [[ "$CODEX_LB" == "1" ]]; then
 
-cat >"$UNIT" <<UNIT_EOF
+  log "Installing codex-lb (https://github.com/Soju06/codex-lb)"
+
+  if uv tool list 2>/dev/null | grep -q '^codex-lb '; then
+    uv tool upgrade codex-lb
+  else
+    uv tool install codex-lb
+  fi
+
+  hash -r
+  command -v codex-lb >/dev/null || die "codex-lb not on PATH after install"
+  info "installed: $(uv tool list | grep '^codex-lb ')"
+
+  log "Configuring the codex-lb service"
+
+  cat >"$UNIT" <<UNIT_EOF
 [Unit]
 Description=codex-lb (ChatGPT account pool / load balancer)
 Documentation=https://soju06.github.io/codex-lb/
@@ -472,65 +513,67 @@ SyslogIdentifier=codex-lb
 [Install]
 WantedBy=default.target
 UNIT_EOF
-info "wrote $UNIT"
+  info "wrote $UNIT"
 
-# Lingering keeps the user manager (and therefore codex-lb) alive across
-# logout and starts it at boot without an interactive session.
-if ! loginctl show-user "$USER" --property=Linger 2>/dev/null | grep -q 'Linger=yes'; then
-  "${SUDO[@]}" loginctl enable-linger "$USER"
-  info "enabled systemd lingering for $USER"
-else
-  info "systemd lingering already enabled"
-fi
+  systemctl --user daemon-reload
+  systemctl --user enable codex-lb.service >/dev/null
+  systemctl --user restart codex-lb.service
+  info "service enabled and (re)started"
 
-systemctl --user daemon-reload
-systemctl --user enable codex-lb.service >/dev/null
-systemctl --user restart codex-lb.service
-info "service enabled and (re)started"
+  log "Waiting for codex-lb to become healthy"
 
-# ---------------------------------------------------------------------------
-# 7. Wait for codex-lb to answer
-# ---------------------------------------------------------------------------
-log "Waiting for codex-lb to become healthy"
+  # Startup blocks on an alembic revision check against store.db, which grows with
+  # request history — a ~325MB store took ~120s to reach "Application startup
+  # complete", right at the edge of the old 60x2s budget. Allow ~5min.
+  LB_READY=0
+  for _ in $(seq 1 150); do
+    if curl -fsS -o /dev/null --max-time 3 "http://127.0.0.1:${CODEX_LB_PORT}/"; then
+      LB_READY=1
+      break
+    fi
+    sleep 2
+  done
 
-# Startup blocks on an alembic revision check against store.db, which grows with
-# request history — a ~325MB store took ~120s to reach "Application startup
-# complete", right at the edge of the old 60x2s budget. Allow ~5min.
-LB_READY=0
-for _ in $(seq 1 150); do
-  if curl -fsS -o /dev/null --max-time 3 "http://127.0.0.1:${CODEX_LB_PORT}/"; then
-    LB_READY=1
-    break
+  if [[ "$LB_READY" == "1" ]]; then
+    info "responding on http://127.0.0.1:${CODEX_LB_PORT}/"
+  else
+    warn "no response after ~5min. Check: journalctl --user -u codex-lb -n 50 --no-pager"
   fi
-  sleep 2
-done
 
-if [[ "$LB_READY" == "1" ]]; then
-  info "responding on http://127.0.0.1:${CODEX_LB_PORT}/"
 else
-  warn "no response after ~5min. Check: journalctl --user -u codex-lb -n 50 --no-pager"
+
+  log "codex-lb"
+  info "CODEX_LB=0 — skipping (set CODEX_LB=1 to install it and route Codex through it)"
+
 fi
 
 # ---------------------------------------------------------------------------
-# 8. Point Codex at codex-lb
+# 8. Codex configuration
 # ---------------------------------------------------------------------------
-log "Configuring Codex to use codex-lb"
+log "Configuring Codex"
 
-# requires_openai_auth = true makes Codex insist on ~/.codex/auth.json even
-# though codex-lb supplies the real credentials, so seed a placeholder key.
-# Only write it when absent — never clobber a real login.
-if [[ ! -s "$CODEX_HOME/auth.json" ]]; then
-  umask 077
-  printf '{\n  "auth_mode": "apikey",\n  "OPENAI_API_KEY": "codex-lb"\n}\n' >"$CODEX_HOME/auth.json"
-  info "seeded placeholder $CODEX_HOME/auth.json"
-else
-  info "$CODEX_HOME/auth.json already exists — left untouched"
+# The placeholder key belongs to codex-lb: requires_openai_auth = true makes
+# Codex insist on ~/.codex/auth.json even though codex-lb supplies the real
+# credentials. Without codex-lb there is no such provider, and writing a fake
+# apikey here would stand in the way of a real `codex login`.
+if [[ "$CODEX_LB" == "1" ]]; then
+  # Only write it when absent — never clobber a real login. The umask is scoped
+  # to a subshell (as in write_op_env): it used to leak into the rest of the
+  # script, which is the only reason config.toml came out 0600 — and only on
+  # boxes that happened to have no auth.json yet. chmod below replaces that.
+  if [[ ! -s "$CODEX_HOME/auth.json" ]]; then
+    ( umask 077; printf '{\n  "auth_mode": "apikey",\n  "OPENAI_API_KEY": "codex-lb"\n}\n' >"$CODEX_HOME/auth.json" )
+    info "seeded placeholder $CODEX_HOME/auth.json"
+  else
+    info "$CODEX_HOME/auth.json already exists — left untouched"
+  fi
 fi
 
-# Patch config.toml in place: replace the three top-level keys and the
-# [model_providers.codex-lb] table, leaving every other section (plugins,
-# marketplaces, projects, MCP servers, ...) exactly as-is.
+# Patch config.toml in place: replace the top-level keys and, when codex-lb is
+# enabled, the [model_providers.codex-lb] table — leaving every other section
+# (plugins, marketplaces, projects, MCP servers, ...) exactly as-is.
 CODEX_MODEL="$CODEX_MODEL" CODEX_EFFORT="$CODEX_EFFORT" CODEX_LB_PORT="$CODEX_LB_PORT" \
+CODEX_LB="$CODEX_LB" \
 CODEX_CONFIG="$CODEX_HOME/config.toml" python3 - <<'PY'
 import os, re, shutil
 
@@ -538,6 +581,7 @@ path   = os.environ["CODEX_CONFIG"]
 model  = os.environ["CODEX_MODEL"]
 effort = os.environ["CODEX_EFFORT"]
 port   = os.environ["CODEX_LB_PORT"]
+lb     = os.environ["CODEX_LB"] == "1"
 
 provider = f"""[model_providers.codex-lb]
 name = "openai"  # required -- enables remote /responses/compact
@@ -550,8 +594,12 @@ requires_openai_auth = true  # required for the Codex app-server
 top = [
     ("model", f'model = "{model}"'),
     ("model_reasoning_effort", f'model_reasoning_effort = "{effort}"'),
-    ("model_provider", 'model_provider = "codex-lb"'),
 ]
+# Only claim model_provider when we are actually standing up the provider.
+# With codex-lb off an existing pointer is left as it is: the flag decides what
+# gets installed, not what gets removed.
+if lb:
+    top.append(("model_provider", 'model_provider = "codex-lb"'))
 
 if os.path.exists(path):
     with open(path) as fh:
@@ -563,19 +611,22 @@ else:
 
 is_table = lambda s: s.lstrip().startswith("[")
 
-# Drop any existing [model_providers.codex-lb] table.
-out, skipping = [], False
-for line in lines:
-    if skipping:
-        if is_table(line):
-            skipping = False
-        else:
+# Drop any existing [model_providers.codex-lb] table so the one appended below
+# replaces it. Skipped when codex-lb is off, so a re-run without CODEX_LB=1
+# does not strip the table out from under a box that is still using it.
+if lb:
+    out, skipping = [], False
+    for line in lines:
+        if skipping:
+            if is_table(line):
+                skipping = False
+            else:
+                continue
+        if re.match(r'\s*\[model_providers\.(codex-lb|"codex-lb")\]\s*$', line):
+            skipping = True
             continue
-    if re.match(r'\s*\[model_providers\.(codex-lb|"codex-lb")\]\s*$', line):
-        skipping = True
-        continue
-    out.append(line)
-lines = out
+        out.append(line)
+    lines = out
 
 # Split into the top-level preamble and the remaining tables.
 first_table = next((i for i, l in enumerate(lines) if is_table(l)), len(lines))
@@ -593,7 +644,7 @@ for key, rendered in top:
 
 pre = [l for l in pre if l.strip()]          # tidy stray blank lines
 body = "\n".join(pre + [""] + rest).rstrip() + "\n"
-if not body.endswith(provider):
+if lb and not body.endswith(provider):
     body = body.rstrip() + "\n\n" + provider
 
 with open(path, "w") as fh:
@@ -602,6 +653,12 @@ with open(path, "w") as fh:
 print(f"    wrote {path}" + ("  (previous version saved as config.toml.bak)" if backed_up else ""))
 PY
 
+# config.toml carries MCP server definitions, and those routinely hold API keys
+# in their env blocks. Set the mode explicitly rather than depending on the
+# umask in effect, which is what decided this before.
+chmod 600 "$CODEX_HOME/config.toml"
+[[ -f "$CODEX_HOME/config.toml.bak" ]] && chmod 600 "$CODEX_HOME/config.toml.bak"
+
 # ---------------------------------------------------------------------------
 # 9. Codex app-server daemon (remote control)
 # ---------------------------------------------------------------------------
@@ -609,7 +666,7 @@ PY
 # over a unix socket at ~/.codex/app-server-control/. `daemon bootstrap`
 # installs durable management for it (survives SSH disconnects); with
 # --remote-control it also accepts sessions from the Codex app after pairing.
-# Bootstrapped last so the daemon starts with the codex-lb provider in place.
+# Bootstrapped last so the daemon starts with the finished config.toml in place.
 log "Setting up the Codex app-server daemon"
 
 if codex app-server daemon bootstrap --remote-control </dev/null; then
@@ -765,24 +822,60 @@ fi
 # ---------------------------------------------------------------------------
 log "Done"
 
+# The codex-lb lines only make sense when it is actually on the box — but being
+# on the box is not the same as CODEX_LB=1. Step 7 skips rather than uninstalls,
+# so a machine provisioned before this run still has the service and still has
+# config.toml pointing at it; saying "not installed" there would be a lie, and
+# "run codex login" would be wrong advice. Three states, not two.
+if [[ "$CODEX_LB" == "1" ]]; then
+  LB_STATE=installed
+elif [[ -f "$UNIT" ]] || command -v codex-lb >/dev/null 2>&1; then
+  LB_STATE=preserved
+else
+  LB_STATE=absent
+fi
+
+if [[ "$LB_STATE" == "absent" ]]; then
+  LB_STATUS="not installed (CODEX_LB=1 to enable)"
+  LB_FIRST_STEP="1. Sign Codex in to your ChatGPT account:
+           codex login"
+  LB_SERVICES=""
+else
+  # `is-active` exits nonzero for anything but "active" — a status result, not a
+  # command failure. It still prints the state, so keep the text and drop the
+  # exit code; without the `|| true` set -e would abort the whole summary at
+  # exactly the moment the summary is most worth having.
+  LB_VERSION="$(uv tool list 2>/dev/null | awk '/^codex-lb /{print $2}')"
+  LB_STATUS="${LB_VERSION:-unknown}  ($(systemctl --user is-active codex-lb.service || true))"
+  if [[ "$LB_STATE" == "preserved" ]]; then
+    LB_STATUS="$LB_STATUS  — left in place; this run had CODEX_LB=0"
+  fi
+  LB_FIRST_STEP="1. Open the codex-lb dashboard and add your ChatGPT account(s):
+           http://127.0.0.1:${CODEX_LB_PORT}
+       Set a dashboard password (and TOTP) there before exposing the port."
+  LB_SERVICES="   systemctl --user status codex-lb        # load balancer
+       systemctl --user restart codex-lb
+       journalctl --user -u codex-lb -f
+
+    "
+fi
+
 cat <<SUMMARY
     gh          $(gh --version | head -1)  ($(gh auth status --hostname github.com >/dev/null 2>&1 && echo 'signed in' || echo 'NOT signed in'))
     codex       $(codex --version 2>&1 | head -1)
     claude      $(claude --version 2>&1 | head -1)  ($([[ -s "$CLAUDE_CREDS" ]] && echo 'signed in' || echo 'NOT signed in'))
     op          $(op --version 2>&1 | head -1)  ($([[ -s "$OP_ENV" ]] && echo 'token stored' || echo 'NO token'))
-    codex-lb    $(uv tool list | grep '^codex-lb ' | awk '{print $2}')  ($(systemctl --user is-active codex-lb.service))
+    codex-lb    ${LB_STATUS}
     app-server  $(codex app-server daemon version 2>/dev/null | (jq -r '.status // "unknown"' 2>/dev/null || cat))
 
     Next steps
     ----------
-    1. Open the codex-lb dashboard and add your ChatGPT account(s):
-           http://127.0.0.1:${CODEX_LB_PORT}
-       Set a dashboard password (and TOTP) there before exposing the port.
+    ${LB_FIRST_STEP}
 
     2. Pair the Codex app with this machine (prints a short-lived code):
            codex remote-control pair
 
-    3. Verify Codex is routing through codex-lb:
+    3. Verify Codex works:
            codex doctor
            codex exec 'say hi'
 
@@ -794,11 +887,7 @@ cat <<SUMMARY
 
     Managing the services
     ---------------------
-       systemctl --user status codex-lb        # load balancer
-       systemctl --user restart codex-lb
-       journalctl --user -u codex-lb -f
-
-       codex app-server daemon version         # app-server
+    ${LB_SERVICES}   codex app-server daemon version         # app-server
        codex app-server daemon restart
        tail -f ~/.codex/app-server-control/app-server.log
 
@@ -814,5 +903,5 @@ if [[ -f /var/run/reboot-required ]]; then
     info "triggered by: $(sort -u /var/run/reboot-required.pkgs | tr '\n' ' ')"
   fi
   info "running kernel: $(uname -r)"
-  info "reboot when convenient; codex-lb comes back on its own (lingering is enabled)"
+  info "reboot when convenient; the user services come back on their own (lingering is enabled)"
 fi
