@@ -557,10 +557,12 @@ log "Configuring Codex"
 # credentials. Without codex-lb there is no such provider, and writing a fake
 # apikey here would stand in the way of a real `codex login`.
 if [[ "$CODEX_LB" == "1" ]]; then
-  # Only write it when absent — never clobber a real login.
+  # Only write it when absent — never clobber a real login. The umask is scoped
+  # to a subshell (as in write_op_env): it used to leak into the rest of the
+  # script, which is the only reason config.toml came out 0600 — and only on
+  # boxes that happened to have no auth.json yet. chmod below replaces that.
   if [[ ! -s "$CODEX_HOME/auth.json" ]]; then
-    umask 077
-    printf '{\n  "auth_mode": "apikey",\n  "OPENAI_API_KEY": "codex-lb"\n}\n' >"$CODEX_HOME/auth.json"
+    ( umask 077; printf '{\n  "auth_mode": "apikey",\n  "OPENAI_API_KEY": "codex-lb"\n}\n' >"$CODEX_HOME/auth.json" )
     info "seeded placeholder $CODEX_HOME/auth.json"
   else
     info "$CODEX_HOME/auth.json already exists — left untouched"
@@ -650,6 +652,12 @@ with open(path, "w") as fh:
 
 print(f"    wrote {path}" + ("  (previous version saved as config.toml.bak)" if backed_up else ""))
 PY
+
+# config.toml carries MCP server definitions, and those routinely hold API keys
+# in their env blocks. Set the mode explicitly rather than depending on the
+# umask in effect, which is what decided this before.
+chmod 600 "$CODEX_HOME/config.toml"
+[[ -f "$CODEX_HOME/config.toml.bak" ]] && chmod 600 "$CODEX_HOME/config.toml.bak"
 
 # ---------------------------------------------------------------------------
 # 9. Codex app-server daemon (remote control)
@@ -814,11 +822,34 @@ fi
 # ---------------------------------------------------------------------------
 log "Done"
 
-# The codex-lb lines only make sense when it was installed, and `uv tool list |
-# grep` / `systemctl is-active` would print blanks and "inactive" otherwise. So
-# build those fragments up front and interpolate them into the summary.
+# The codex-lb lines only make sense when it is actually on the box — but being
+# on the box is not the same as CODEX_LB=1. Step 7 skips rather than uninstalls,
+# so a machine provisioned before this run still has the service and still has
+# config.toml pointing at it; saying "not installed" there would be a lie, and
+# "run codex login" would be wrong advice. Three states, not two.
 if [[ "$CODEX_LB" == "1" ]]; then
-  LB_STATUS="$(uv tool list | grep '^codex-lb ' | awk '{print $2}')  ($(systemctl --user is-active codex-lb.service))"
+  LB_STATE=installed
+elif [[ -f "$UNIT" ]] || command -v codex-lb >/dev/null 2>&1; then
+  LB_STATE=preserved
+else
+  LB_STATE=absent
+fi
+
+if [[ "$LB_STATE" == "absent" ]]; then
+  LB_STATUS="not installed (CODEX_LB=1 to enable)"
+  LB_FIRST_STEP="1. Sign Codex in to your ChatGPT account:
+           codex login"
+  LB_SERVICES=""
+else
+  # `is-active` exits nonzero for anything but "active" — a status result, not a
+  # command failure. It still prints the state, so keep the text and drop the
+  # exit code; without the `|| true` set -e would abort the whole summary at
+  # exactly the moment the summary is most worth having.
+  LB_VERSION="$(uv tool list 2>/dev/null | awk '/^codex-lb /{print $2}')"
+  LB_STATUS="${LB_VERSION:-unknown}  ($(systemctl --user is-active codex-lb.service || true))"
+  if [[ "$LB_STATE" == "preserved" ]]; then
+    LB_STATUS="$LB_STATUS  — left in place; this run had CODEX_LB=0"
+  fi
   LB_FIRST_STEP="1. Open the codex-lb dashboard and add your ChatGPT account(s):
            http://127.0.0.1:${CODEX_LB_PORT}
        Set a dashboard password (and TOTP) there before exposing the port."
@@ -827,11 +858,6 @@ if [[ "$CODEX_LB" == "1" ]]; then
        journalctl --user -u codex-lb -f
 
     "
-else
-  LB_STATUS="not installed (CODEX_LB=1 to enable)"
-  LB_FIRST_STEP="1. Sign Codex in to your ChatGPT account:
-           codex login"
-  LB_SERVICES=""
 fi
 
 cat <<SUMMARY
