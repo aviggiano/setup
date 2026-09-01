@@ -10,7 +10,8 @@
 #                              provider when codex-lb is enabled
 #   * Codex app-server daemon  bootstrapped with remote control enabled
 #   * Claude Code              via https://claude.ai/install.sh
-#   * sign-in                  gh, then Claude Code — interactive, last, in series
+#   * sign-in                  gh, Codex (device auth, when codex-lb is off),
+#                              then Claude Code — interactive, last, in series
 #
 # Idempotent: safe to re-run to upgrade an existing install.
 #
@@ -32,6 +33,9 @@
 #   CODEX_LB_HOST     interface codex-lb binds to         (default: 0.0.0.0)
 #   CODEX_LB_PORT     port codex-lb listens on            (default: 2455)
 #   SKIP_APT_UPGRADE  set to 1 to skip the apt upgrade step
+#   GH_AUTH           login (device flow, default) | skip
+#   CODEX_AUTH        login (device auth, default) | skip — ignored when
+#                     CODEX_LB=1, where the accounts live in codex-lb
 #   CLAUDE_AUTH       login (browser OAuth, default) | token (setup-token) | skip
 #   OP_AUTH           auto (default) | prompt | skip
 #   OP_SERVICE_ACCOUNT_TOKEN
@@ -67,6 +71,24 @@ esac
 CODEX_LB_HOST="${CODEX_LB_HOST:-0.0.0.0}"
 CODEX_LB_PORT="${CODEX_LB_PORT:-2455}"
 SKIP_APT_UPGRADE="${SKIP_APT_UPGRADE:-0}"
+# Each of the three sign-ins in step 10 has its own switch. They used to share
+# one — CLAUDE_AUTH=skip skipped gh as well — which stopped making sense once
+# Codex joined them.
+GH_AUTH="${GH_AUTH:-login}"
+case "$GH_AUTH" in
+  login | skip) ;;
+  *) printf 'GH_AUTH must be login or skip (got: %s)\n' "$GH_AUTH" >&2; exit 1 ;;
+esac
+# login = `codex login --device-auth`, the device-code flow
+# skip  = leave sign-in to you
+# Only consulted when CODEX_LB=0. With codex-lb the ChatGPT accounts are added
+# in its dashboard and ~/.codex/auth.json holds a placeholder, so there is
+# nothing for `codex login` to do.
+CODEX_AUTH="${CODEX_AUTH:-login}"
+case "$CODEX_AUTH" in
+  login | skip) ;;
+  *) printf 'CODEX_AUTH must be login or skip (got: %s)\n' "$CODEX_AUTH" >&2; exit 1 ;;
+esac
 # login = browser OAuth, full credentials (needed for Remote Control)
 # token = `claude setup-token`, model requests only
 # skip  = leave sign-in to you
@@ -686,19 +708,28 @@ else
   info "$APP_SERVER_STATE"
 fi
 
+# codex-lb being *on the box* is not the same as CODEX_LB=1: step 7 skips
+# rather than uninstalls, so a machine provisioned by an earlier run still has
+# the service, still has config.toml pointing at it, and still has the
+# placeholder auth.json — and `codex login` there would replace that
+# placeholder and break the provider. Step 11 splits the same three states.
+codex_lb_on_box() {
+  [[ "$CODEX_LB" == "1" ]] || [[ -f "$UNIT" ]] || command -v codex-lb >/dev/null 2>&1
+}
+
 # ---------------------------------------------------------------------------
-# 10. Interactive sign-in (gh, then Claude Code) — in series, last
+# 10. Interactive sign-in (gh, Codex, then Claude Code) — in series, last
 # ---------------------------------------------------------------------------
-# Everything above is unattended. These two are not: each prints a code or URL,
+# Everything above is unattended. These are not: each prints a code or URL,
 # waits for you to finish in a browser elsewhere, and must not overlap with the
-# other or you end up pasting the wrong code into the wrong page. So they run
+# others or you end up pasting the wrong code into the wrong page. So they run
 # one at a time, at the very end, and a failure stops the script rather than
 # falling through to a summary that claims success.
 log "Interactive sign-in"
 
 CLAUDE_CREDS="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/.credentials.json"
 
-# --- 10c. 1Password service account ---------------------------------------
+# --- 10d. 1Password service account ---------------------------------------
 # Runs before the terminal gate on purpose: unlike gh and Claude Code this has
 # no browser round trip, and when a provisioner has already put the token in the
 # environment it needs no terminal at all. That is the path that makes an
@@ -722,19 +753,19 @@ else
   info "op: no token supplied — set OP_SERVICE_ACCOUNT_TOKEN, or re-run with a terminal"
 fi
 
-if [[ "$CLAUDE_AUTH" == "skip" ]] || [[ $HAVE_TTY -eq 0 ]]; then
-  if [[ "$CLAUDE_AUTH" == "skip" ]]; then
-    info "CLAUDE_AUTH=skip — not signing in"
-  else
-    info "no terminal — skipping sign-in (provisioning above is complete)"
-  fi
+if [[ $HAVE_TTY -eq 0 ]]; then
+  info "no terminal — skipping sign-in (provisioning above is complete)"
   info "run these yourself, one at a time:"
   info "    GH_BROWSER=true gh auth login --hostname github.com --git-protocol https --web"
+  codex_lb_on_box \
+    || info "    codex login --device-auth"
   info "    claude          # complete /login, then /exit"
 else
 
   # --- 10a. GitHub -------------------------------------------------------
-  if gh auth status --hostname github.com >/dev/null 2>&1; then
+  if [[ "$GH_AUTH" == "skip" ]]; then
+    info "gh: GH_AUTH=skip — not signing in"
+  elif gh auth status --hostname github.com >/dev/null 2>&1; then
     info "gh: already signed in as $(gh api user --jq .login 2>/dev/null || echo '?')"
   else
     cat <<'GH_EOF'
@@ -762,13 +793,52 @@ GH_EOF
     info "gh: signed in as $(gh api user --jq .login 2>/dev/null || echo '?')"
   fi
 
-  # --- 10b. Claude Code --------------------------------------------------
+  # --- 10b. Codex --------------------------------------------------------
+  # Only when codex-lb is off. With CODEX_LB=1 the ChatGPT accounts are added in
+  # the codex-lb dashboard and ~/.codex/auth.json is the placeholder written in
+  # step 8 — a real login here would replace it and break the provider.
+  #
+  # --device-auth is the device-code flow. The default `codex login` opens a
+  # browser against a localhost callback, which a headless box cannot serve; the
+  # device flow prints a URL and a code instead and polls until you approve.
+  if [[ "$CODEX_LB" == "1" ]]; then
+    info "codex: CODEX_LB=1 — accounts live in the codex-lb dashboard, not in ~/.codex/auth.json"
+  elif codex_lb_on_box; then
+    info "codex: codex-lb left in place by an earlier run — accounts live in its dashboard, not in ~/.codex/auth.json"
+  elif [[ "$CODEX_AUTH" == "skip" ]]; then
+    info "codex: CODEX_AUTH=skip — not signing in"
+  elif codex login status >/dev/null 2>&1; then
+    info "codex: $(codex login status 2>&1 | head -1)"
+  else
+    cat <<'CODEX_EOF'
+
+    codex will print a URL and a one-time code. On your laptop, open the URL,
+    paste the code, and approve. codex finishes on its own — nothing is typed
+    back into this terminal.
+
+CODEX_EOF
+    # </dev/tty for the same reason as gh above: under `curl | bash` our stdin
+    # is this script's source.
+    codex login --device-auth </dev/tty \
+      || die "codex login did not complete. Re-run the script when ready; it is idempotent."
+    codex login status >/dev/null 2>&1 \
+      || die "codex reports no credentials after login"
+    info "codex: $(codex login status 2>&1 | head -1)"
+    # The app-server (step 9) was bootstrapped before these credentials existed.
+    # Restart it so remote-control sessions pick them up.
+    codex app-server daemon restart </dev/null >/dev/null 2>&1 \
+      || warn "could not restart the app-server daemon; run 'codex app-server daemon restart' yourself"
+  fi
+
+  # --- 10c. Claude Code --------------------------------------------------
   # Note: Claude Code has no device-code flow. `claude` runs a browser OAuth
   # round trip against a localhost callback; over SSH that callback is usually
   # unreachable, so the browser shows a code you paste back at the CLI's
   # "Paste code here if prompted" prompt. That is the paste step here.
   #   https://code.claude.com/docs/en/authentication
-  if [[ -s "$CLAUDE_CREDS" ]]; then
+  if [[ "$CLAUDE_AUTH" == "skip" ]]; then
+    info "claude: CLAUDE_AUTH=skip — not signing in"
+  elif [[ -s "$CLAUDE_CREDS" ]]; then
     info "claude: credentials already present ($CLAUDE_CREDS)"
   elif [[ "$CLAUDE_AUTH" == "token" ]]; then
     cat <<'TOKEN_EOF'
@@ -837,8 +907,15 @@ fi
 
 if [[ "$LB_STATE" == "absent" ]]; then
   LB_STATUS="not installed (CODEX_LB=1 to enable)"
-  LB_FIRST_STEP="1. Sign Codex in to your ChatGPT account:
-           codex login"
+  # Step 10b already did this when a terminal was available, so do not tell
+  # someone to run a command they have just finished running.
+  if codex login status >/dev/null 2>&1; then
+    LB_FIRST_STEP="1. Codex is signed in to your ChatGPT account —
+           $(codex login status 2>&1 | head -1)"
+  else
+    LB_FIRST_STEP="1. Sign Codex in to your ChatGPT account:
+           codex login --device-auth"
+  fi
   LB_SERVICES=""
 else
   # `is-active` exits nonzero for anything but "active" — a status result, not a
@@ -862,7 +939,10 @@ fi
 
 cat <<SUMMARY
     gh          $(gh --version | head -1)  ($(gh auth status --hostname github.com >/dev/null 2>&1 && echo 'signed in' || echo 'NOT signed in'))
-    codex       $(codex --version 2>&1 | head -1)
+    codex       $(codex --version 2>&1 | head -1)  ($(
+                  if codex_lb_on_box; then echo 'via codex-lb'
+                  elif codex login status >/dev/null 2>&1; then echo 'signed in'
+                  else echo 'NOT signed in'; fi))
     claude      $(claude --version 2>&1 | head -1)  ($([[ -s "$CLAUDE_CREDS" ]] && echo 'signed in' || echo 'NOT signed in'))
     op          $(op --version 2>&1 | head -1)  ($([[ -s "$OP_ENV" ]] && echo 'token stored' || echo 'NO token'))
     codex-lb    ${LB_STATUS}
