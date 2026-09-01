@@ -708,6 +708,15 @@ else
   info "$APP_SERVER_STATE"
 fi
 
+# codex-lb being *on the box* is not the same as CODEX_LB=1: step 7 skips
+# rather than uninstalls, so a machine provisioned by an earlier run still has
+# the service, still has config.toml pointing at it, and still has the
+# placeholder auth.json — and `codex login` there would replace that
+# placeholder and break the provider. Step 11 splits the same three states.
+codex_lb_on_box() {
+  [[ "$CODEX_LB" == "1" ]] || [[ -f "$UNIT" ]] || command -v codex-lb >/dev/null 2>&1
+}
+
 # ---------------------------------------------------------------------------
 # 10. Interactive sign-in (gh, Codex, then Claude Code) — in series, last
 # ---------------------------------------------------------------------------
@@ -748,7 +757,7 @@ if [[ $HAVE_TTY -eq 0 ]]; then
   info "no terminal — skipping sign-in (provisioning above is complete)"
   info "run these yourself, one at a time:"
   info "    GH_BROWSER=true gh auth login --hostname github.com --git-protocol https --web"
-  [[ "$CODEX_LB" == "1" ]] \
+  codex_lb_on_box \
     || info "    codex login --device-auth"
   info "    claude          # complete /login, then /exit"
 else
@@ -794,10 +803,12 @@ GH_EOF
   # device flow prints a URL and a code instead and polls until you approve.
   if [[ "$CODEX_LB" == "1" ]]; then
     info "codex: CODEX_LB=1 — accounts live in the codex-lb dashboard, not in ~/.codex/auth.json"
+  elif codex_lb_on_box; then
+    info "codex: codex-lb left in place by an earlier run — accounts live in its dashboard, not in ~/.codex/auth.json"
   elif [[ "$CODEX_AUTH" == "skip" ]]; then
     info "codex: CODEX_AUTH=skip — not signing in"
   elif codex login status >/dev/null 2>&1; then
-    info "codex: $(codex login status 2>/dev/null | head -1)"
+    info "codex: $(codex login status 2>&1 | head -1)"
   else
     cat <<'CODEX_EOF'
 
@@ -812,7 +823,7 @@ CODEX_EOF
       || die "codex login did not complete. Re-run the script when ready; it is idempotent."
     codex login status >/dev/null 2>&1 \
       || die "codex reports no credentials after login"
-    info "codex: $(codex login status 2>/dev/null | head -1)"
+    info "codex: $(codex login status 2>&1 | head -1)"
     # The app-server (step 9) was bootstrapped before these credentials existed.
     # Restart it so remote-control sessions pick them up.
     codex app-server daemon restart </dev/null >/dev/null 2>&1 \
@@ -900,7 +911,7 @@ if [[ "$LB_STATE" == "absent" ]]; then
   # someone to run a command they have just finished running.
   if codex login status >/dev/null 2>&1; then
     LB_FIRST_STEP="1. Codex is signed in to your ChatGPT account —
-           $(codex login status 2>/dev/null | head -1)"
+           $(codex login status 2>&1 | head -1)"
   else
     LB_FIRST_STEP="1. Sign Codex in to your ChatGPT account:
            codex login --device-auth"
@@ -929,7 +940,7 @@ fi
 cat <<SUMMARY
     gh          $(gh --version | head -1)  ($(gh auth status --hostname github.com >/dev/null 2>&1 && echo 'signed in' || echo 'NOT signed in'))
     codex       $(codex --version 2>&1 | head -1)  ($(
-                  if [[ "$CODEX_LB" == "1" ]]; then echo 'via codex-lb'
+                  if codex_lb_on_box; then echo 'via codex-lb'
                   elif codex login status >/dev/null 2>&1; then echo 'signed in'
                   else echo 'NOT signed in'; fi))
     claude      $(claude --version 2>&1 | head -1)  ($([[ -s "$CLAUDE_CREDS" ]] && echo 'signed in' || echo 'NOT signed in'))
