@@ -10,6 +10,7 @@
 #                              provider when codex-lb is enabled
 #   * Codex app-server daemon  bootstrapped with remote control enabled
 #   * Claude Code              via https://claude.ai/install.sh
+#   * T3 Code (default on)     release tarball + its systemd --user service
 #   * sign-in                  gh, Codex (device auth, when codex-lb is off),
 #                              then Claude Code — interactive, last, in series
 #
@@ -37,7 +38,10 @@
 #   CODEX_AUTH        login (device auth, default) | skip — ignored when
 #                     CODEX_LB=1, where the accounts live in codex-lb
 #   CLAUDE_AUTH       login (browser OAuth, default) | token (setup-token) | skip
-#   OP_AUTH           auto (default) | prompt | skip
+#   T3CODE            0 to skip installing T3 Code and its service
+#                                                         (default: 1)
+#   OP_AUTH           skip (default) | auto | prompt — auto stores
+#                     OP_SERVICE_ACCOUNT_TOKEN or prompts for one
 #   OP_SERVICE_ACCOUNT_TOKEN
 #                     1Password service account token; when set it is stored
 #                     without prompting, which is how an automated provisioner
@@ -97,13 +101,24 @@ case "$CLAUDE_AUTH" in
   login | token | skip) ;;
   *) printf 'CLAUDE_AUTH must be login, token or skip (got: %s)\n' "$CLAUDE_AUTH" >&2; exit 1 ;;
 esac
+# skip   = leave 1Password alone (the op binary is still installed)
 # auto   = use OP_SERVICE_ACCOUNT_TOKEN if set, else prompt when a terminal exists
 # prompt = always ask, even if the variable is already set
-# skip   = leave 1Password alone
-OP_AUTH="${OP_AUTH:-auto}"
+# Off by default: most boxes never get a service account, and the prompt was one
+# more thing to press Enter through on every fresh install.
+OP_AUTH="${OP_AUTH:-skip}"
 case "$OP_AUTH" in
   auto | prompt | skip) ;;
   *) printf 'OP_AUTH must be auto, prompt or skip (got: %s)\n' "$OP_AUTH" >&2; exit 1 ;;
+esac
+# T3 Code (https://github.com/pingdotgg/t3code) is a web UI over the Claude Code
+# and Codex CLIs installed above. On by default; T3CODE=0 skips it. Like
+# CODEX_LB, skipping means "do not set it up", not "tear it down".
+T3CODE="${T3CODE:-1}"
+case "$T3CODE" in
+  1 | true | yes) T3CODE=1 ;;
+  0 | false | no) T3CODE=0 ;;
+  *) printf 'T3CODE must be 0 or 1 (got: %s)\n' "$T3CODE" >&2; exit 1 ;;
 esac
 
 # Non-login shells (cron, `ssh host 'cmd'`, `docker exec`) often do not export
@@ -116,6 +131,8 @@ CODEX_HOME="$HOME/.codex"
 UNIT_DIR="$HOME/.config/systemd/user"
 UNIT="$UNIT_DIR/codex-lb.service"
 OP_ENV="$HOME/.config/op.env"
+T3_HOME="$HOME/.t3"
+T3_STATE="$T3_HOME/runtime/service-state.json"
 
 log()  { printf '\n\033[1;34m==>\033[0m \033[1m%s\033[0m\n' "$*"; }
 info() { printf '    %s\n' "$*"; }
@@ -708,6 +725,99 @@ else
   info "$APP_SERVER_STATE"
 fi
 
+# ---------------------------------------------------------------------------
+# 9b. T3 Code — install and background service   (default on: T3CODE=0 skips)
+# ---------------------------------------------------------------------------
+# From the GitHub release tarball, not `npx t3`. The npm package keeps its
+# binary in a per-platform optional dependency that bundles node-pty, and npm
+# compiles node-pty on install — without make and g++ that fails silently, and
+# t3 then reports "no build for linux-x64". The tarball ships node-pty prebuilt,
+# so this needs neither Node nor a compiler.
+#
+# `t3 service install` copies the release into ~/.t3/runtime/versions/<v>/ and
+# writes a systemd --user unit (t3code.service). From then on `t3 update`
+# upgrades both, so a re-run upgrades through it instead of downloading again.
+# `t3 service uninstall` removes the unit but keeps ~/.t3/runtime, so "the
+# binary is there" and "the service is installed" are checked separately.
+# The server listens on 127.0.0.1:3773 only; `t3 pair` handles remote access.
+t3_bin() {
+  local v
+  v="$(jq -r '.activeVersion // empty' "$T3_STATE" 2>/dev/null)" || return 1
+  [[ -n "$v" && -x "$T3_HOME/runtime/versions/$v/t3" ]] || return 1
+  printf '%s\n' "$T3_HOME/runtime/versions/$v/t3"
+}
+
+if [[ "$T3CODE" == "1" ]]; then
+
+  log "Installing T3 Code (https://github.com/pingdotgg/t3code)"
+
+  if T3_BIN="$(t3_bin)" && [[ -f "$UNIT_DIR/t3code.service" ]]; then
+    info "found $("$T3_BIN" --version 2>&1 | head -1) — upgrading in place"
+    # -y: without it update asks before restarting the service, and there is
+    # no one to answer here.
+    "$T3_BIN" update -y </dev/null || warn "t3 update failed; keeping the installed version"
+  elif T3_BIN="$(t3_bin)"; then
+    info "found $("$T3_BIN" --version 2>&1 | head -1) without its service — reinstalling it"
+    "$T3_BIN" service install </dev/null || die "t3 service install failed"
+    "$T3_BIN" update -y </dev/null || warn "t3 update failed; keeping the installed version"
+  else
+    case "$(dpkg --print-architecture)" in
+      amd64) T3_ARCH=x64 ;;
+      arm64) T3_ARCH=arm64 ;;
+      *)     T3_ARCH="" ;;
+    esac
+    if [[ -z "$T3_ARCH" ]]; then
+      warn "no T3 Code build for $(dpkg --print-architecture); skipping"
+    else
+      # /releases/latest redirects to the newest stable tag. Going by the
+      # redirect instead of api.github.com avoids its unauthenticated rate limit.
+      T3_TAG="$(curl -fsSLI -o /dev/null -w '%{url_effective}' \
+        https://github.com/pingdotgg/t3code/releases/latest)"
+      T3_TAG="${T3_TAG##*/}"
+      [[ "$T3_TAG" == v* ]] || die "could not resolve the latest T3 Code release"
+      T3_TARBALL="t3-${T3_TAG#v}-linux-${T3_ARCH}.tar.gz"
+      T3_URL="https://github.com/pingdotgg/t3code/releases/download/$T3_TAG"
+      curl -fsSL "$T3_URL/$T3_TARBALL" -o "$TMPWORK/$T3_TARBALL" \
+        || die "could not download $T3_URL/$T3_TARBALL"
+      curl -fsSL "$T3_URL/SHA256SUMS" -o "$TMPWORK/t3.SHA256SUMS" \
+        || die "could not download $T3_URL/SHA256SUMS"
+      ( cd "$TMPWORK" && grep -F " $T3_TARBALL" t3.SHA256SUMS | sha256sum -c --quiet - ) \
+        || die "checksum mismatch for $T3_TARBALL"
+      tar -xzf "$TMPWORK/$T3_TARBALL" -C "$TMPWORK"
+      "$TMPWORK/${T3_TARBALL%.tar.gz}/t3" service install </dev/null \
+        || die "t3 service install failed"
+    fi
+  fi
+
+  # Nothing puts t3 on PATH: the service runs the versioned binary directly.
+  # This shim follows activeVersion, so it keeps working after `t3 update`. An
+  # existing t3 that is not ours (an npm launcher, say) is left alone.
+  T3_SHIM="$LOCAL_BIN/t3"
+  if [[ ! -e "$T3_SHIM" ]] || grep -qsF 'aviggiano/setup' "$T3_SHIM"; then
+    cat >"$T3_SHIM" <<'T3_SHIM_EOF'
+#!/bin/sh
+# t3 launcher — added by aviggiano/setup. Runs the version the service is on.
+state="$HOME/.t3/runtime/service-state.json"
+v="$(jq -r '.activeVersion // empty' "$state" 2>/dev/null)"
+[ -n "$v" ] || { echo "t3: no installed version in $state" >&2; exit 1; }
+exec "$HOME/.t3/runtime/versions/$v/t3" "$@"
+T3_SHIM_EOF
+    chmod 755 "$T3_SHIM"
+  fi
+
+  if T3_BIN="$(t3_bin)"; then
+    info "$("$T3_BIN" --version 2>&1 | head -1), service $(systemctl --user is-active t3code.service || true)"
+  else
+    warn "T3 Code is not installed — see the output above"
+  fi
+
+else
+
+  log "T3 Code"
+  info "T3CODE=0 — skipping"
+
+fi
+
 # codex-lb being *on the box* is not the same as CODEX_LB=1: step 7 skips
 # rather than uninstalls, so a machine provisioned by an earlier run still has
 # the service, still has config.toml pointing at it, and still has the
@@ -937,6 +1047,29 @@ else
     "
 fi
 
+# is-active: same `|| true` as codex-lb above.
+if T3_BIN="$(t3_bin)"; then
+  T3_STATUS="$("$T3_BIN" --version 2>&1 | head -1)  ($(systemctl --user is-active t3code.service || true))"
+  T3_PAIR_STEP="
+    3. Pair a browser with T3 Code (the server only listens on 127.0.0.1:3773):
+           t3 pair --tailscale     # over your tailnet, if Tailscale is set up
+       or forward the port and open the printed URL on your laptop:
+           ssh -L 3773:127.0.0.1:3773 <this host>
+           t3 pair
+"
+  T3_SERVICES="   t3 service status                       # T3 Code
+       systemctl --user restart t3code
+       tail -f ~/.t3/userdata/logs/boot-service.log
+
+    "
+elif [[ "$T3CODE" == "1" ]]; then
+  T3_STATUS="NOT installed — see the T3 Code step above"
+  T3_PAIR_STEP="" T3_SERVICES=""
+else
+  T3_STATUS="skipped (T3CODE=0)"
+  T3_PAIR_STEP="" T3_SERVICES=""
+fi
+
 cat <<SUMMARY
     gh          $(gh --version | head -1)  ($(gh auth status --hostname github.com >/dev/null 2>&1 && echo 'signed in' || echo 'NOT signed in'))
     codex       $(codex --version 2>&1 | head -1)  ($(
@@ -944,7 +1077,8 @@ cat <<SUMMARY
                   elif codex login status >/dev/null 2>&1; then echo 'signed in'
                   else echo 'NOT signed in'; fi))
     claude      $(claude --version 2>&1 | head -1)  ($([[ -s "$CLAUDE_CREDS" ]] && echo 'signed in' || echo 'NOT signed in'))
-    op          $(op --version 2>&1 | head -1)  ($([[ -s "$OP_ENV" ]] && echo 'token stored' || echo 'NO token'))
+    op          $(op --version 2>&1 | head -1)  ($([[ -s "$OP_ENV" ]] && echo 'token stored' || echo 'no token — OP_AUTH=auto to add one'))
+    t3          ${T3_STATUS}
     codex-lb    ${LB_STATUS}
     app-server  $(codex app-server daemon version 2>/dev/null | (jq -r '.status // "unknown"' 2>/dev/null || cat))
 
@@ -954,24 +1088,25 @@ cat <<SUMMARY
 
     2. Pair the Codex app with this machine (prints a short-lived code):
            codex remote-control pair
-
-    3. Verify Codex works:
+${T3_PAIR_STEP}
+    4. Verify Codex works:
            codex doctor
            codex exec 'say hi'
 
-    4. See which credentials this machine can reach (no names are baked in —
-       ask 1Password, so a credential added to the vault later just shows up):
+    5. See which credentials this machine can reach (no names are baked in —
+       ask 1Password, so a credential added to the vault later just shows up;
+       store a service account token first with OP_AUTH=auto ./setup.sh):
            op vault list
            op item list --vault <vault>
            op read "op://<vault>/<item>/<field>"
 
     Managing the services
     ---------------------
-    ${LB_SERVICES}   codex app-server daemon version         # app-server
+    ${LB_SERVICES}${T3_SERVICES}   codex app-server daemon version         # app-server
        codex app-server daemon restart
        tail -f ~/.codex/app-server-control/app-server.log
 
-    Note: 'codex', 'claude' and 'uv' live in ~/.local/bin — run 'exec \$SHELL -l'
+    Note: 'codex', 'claude', 'uv' and 't3' live in ~/.local/bin — run 'exec \$SHELL -l'
     or open a new shell if this was a first-time install.
 SUMMARY
 
