@@ -40,6 +40,8 @@
 #   CLAUDE_AUTH       login (browser OAuth, default) | token (setup-token) | skip
 #   T3CODE            0 to skip installing T3 Code and its service
 #                                                         (default: 1)
+#   T3_PAIR_TTL       lifetime of the T3 Code pairing token printed at the end
+#                     when Tailscale is up                (default: 15m)
 #   OP_AUTH           skip (default) | auto | prompt — auto stores
 #                     OP_SERVICE_ACCOUNT_TOKEN or prompts for one
 #   OP_SERVICE_ACCOUNT_TOKEN
@@ -120,6 +122,8 @@ case "$T3CODE" in
   0 | false | no) T3CODE=0 ;;
   *) printf 'T3CODE must be 0 or 1 (got: %s)\n' "$T3CODE" >&2; exit 1 ;;
 esac
+# t3's default is 5m, which is gone before you have read the summary it follows.
+T3_PAIR_TTL="${T3_PAIR_TTL:-15m}"
 
 # Non-login shells (cron, `ssh host 'cmd'`, `docker exec`) often do not export
 # USER, and `set -u` turns that into a hard failure. HOME is set by PAM/sshd in
@@ -747,6 +751,13 @@ t3_bin() {
   printf '%s\n' "$T3_HOME/runtime/versions/$v/t3"
 }
 
+# Tailscale is not installed by this script; when the box is already on a
+# tailnet, T3 Code is paired through it at the end (step 12).
+tailscale_up() {
+  command -v tailscale >/dev/null 2>&1 \
+    && [[ "$(tailscale status --json 2>/dev/null | jq -r '.BackendState // empty')" == "Running" ]]
+}
+
 if [[ "$T3CODE" == "1" ]]; then
 
   log "Installing T3 Code (https://github.com/pingdotgg/t3code)"
@@ -1050,13 +1061,21 @@ fi
 # is-active: same `|| true` as codex-lb above.
 if T3_BIN="$(t3_bin)"; then
   T3_STATUS="$("$T3_BIN" --version 2>&1 | head -1)  ($(systemctl --user is-active t3code.service || true))"
-  T3_PAIR_STEP="
-    3. Pair a browser with T3 Code (the server only listens on 127.0.0.1:3773):
-           t3 pair --tailscale     # over your tailnet, if Tailscale is set up
-       or forward the port and open the printed URL on your laptop:
-           ssh -L 3773:127.0.0.1:3773 <this host>
-           t3 pair
+  if tailscale_up; then
+    T3_PAIR_STEP="
+    3. Pair the T3 Code app: the tailnet pairing URL is printed below (valid
+       ${T3_PAIR_TTL}). Mint a new one with:
+           t3 pair --tailscale
 "
+  else
+    T3_PAIR_STEP="
+    3. Pair a browser with T3 Code (the server only listens on 127.0.0.1:3773).
+       Forward the port and open the printed URL on your laptop:
+           ssh -N -L 13773:127.0.0.1:3773 <this host>
+           t3 pair                 # then swap localhost:3773 for localhost:13773
+       With Tailscale up on this box, re-running setup prints a tailnet URL.
+"
+  fi
   T3_SERVICES="   t3 service status                       # T3 Code
        systemctl --user restart t3code
        tail -f ~/.t3/userdata/logs/boot-service.log
@@ -1119,4 +1138,27 @@ if [[ -f /var/run/reboot-required ]]; then
   fi
   info "running kernel: $(uname -r)"
   info "reboot when convenient; the user services come back on their own (lingering is enabled)"
+fi
+
+# ---------------------------------------------------------------------------
+# 12. T3 Code pairing URL (when Tailscale is up)
+# ---------------------------------------------------------------------------
+# Last, so the URL is the final thing on screen and its token is not spent
+# waiting on the interactive sign-ins. `t3 pair --tailscale` points Tailscale
+# Serve (tailnet only, never Funnel) at 127.0.0.1:3773; that mapping persists,
+# and `tailscale serve --https=443 off` removes it.
+if [[ "$T3CODE" == "1" ]] && T3_BIN="$(t3_bin)" && tailscale_up; then
+  log "Pairing T3 Code over Tailscale"
+
+  # Changing serve config needs root or the operator role. Grant the role once
+  # instead of running t3 under sudo, which would put its state in root's home.
+  if [[ "$(tailscale debug prefs 2>/dev/null | jq -r '.OperatorUser // empty')" != "$USER" ]]; then
+    "${SUDO[@]}" tailscale set --operator="$USER" \
+      && info "made $USER a Tailscale operator (needed for tailscale serve)" \
+      || warn "could not make $USER a Tailscale operator; run: sudo tailscale set --operator=$USER"
+  fi
+
+  "$T3_BIN" pair --tailscale --ttl "$T3_PAIR_TTL" </dev/null \
+    || warn "t3 pair --tailscale failed. HTTPS certificates must be enabled for the tailnet
+      (admin console → DNS → HTTPS Certificates); then run: t3 pair --tailscale"
 fi
