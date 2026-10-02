@@ -762,6 +762,10 @@ if [[ "$T3CODE" == "1" ]]; then
 
   log "Installing T3 Code (https://github.com/pingdotgg/t3code)"
 
+  # The prebuilt Linux binary needs libatomic.so.1, which minimal Debian/Ubuntu
+  # installs may lack. Install it before invoking t3, including on upgrades.
+  "${APT[@]}" install -y --no-install-recommends libatomic1
+
   if T3_BIN="$(t3_bin)" && [[ -f "$UNIT_DIR/t3code.service" ]]; then
     info "found $("$T3_BIN" --version 2>&1 | head -1) — upgrading in place"
     # -y: without it update asks before restarting the service, and there is
