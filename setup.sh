@@ -10,7 +10,13 @@
 #                              provider when codex-lb is enabled
 #   * Codex app-server daemon  bootstrapped with remote control enabled
 #   * Claude Code              via https://claude.ai/install.sh
-#   * T3 Code (default on)     release tarball + its systemd --user service
+#   * opencode                 via https://opencode.ai/install, plus a plugin
+#                              that stops OpenRouter's prompt-injection
+#                              guardrail from blocking opencode's own prompts
+#   * T3 Code (default on)     release tarball + its systemd --user service,
+#                              with its OpenCode provider switched on
+#   * OPENROUTER_API_KEY       from the environment or a prompt, for opencode
+#                              and the systemd --user services (T3 Code)
 #   * sign-in                  gh, Codex (device auth, when codex-lb is off),
 #                              then Claude Code — interactive, last, in series
 #
@@ -48,6 +54,11 @@
 #                     1Password service account token; when set it is stored
 #                     without prompting, which is how an automated provisioner
 #                     should pass it.
+#   OPENROUTER_AUTH   auto (default) | prompt | skip — auto stores
+#                     OPENROUTER_API_KEY or prompts for one
+#   OPENROUTER_API_KEY
+#                     OpenRouter API key; when set it is stored without
+#                     prompting, and it replaces a key stored by an earlier run.
 #
 # Steps 1-9 are unattended. Step 10 signs you in and needs a *terminal* — but
 # not a terminal on stdin. `curl | bash` makes this script stdin, so sign-in
@@ -113,6 +124,16 @@ case "$OP_AUTH" in
   auto | prompt | skip) ;;
   *) printf 'OP_AUTH must be auto, prompt or skip (got: %s)\n' "$OP_AUTH" >&2; exit 1 ;;
 esac
+# auto   = use OPENROUTER_API_KEY if set, else keep the stored key, else prompt
+#          when a terminal exists
+# prompt = always ask, even if a key is set or stored
+# skip   = leave the stored key alone and do not ask
+# On by default, unlike OP_AUTH: opencode has no OpenRouter access without it.
+OPENROUTER_AUTH="${OPENROUTER_AUTH:-auto}"
+case "$OPENROUTER_AUTH" in
+  auto | prompt | skip) ;;
+  *) printf 'OPENROUTER_AUTH must be auto, prompt or skip (got: %s)\n' "$OPENROUTER_AUTH" >&2; exit 1 ;;
+esac
 # T3 Code (https://github.com/pingdotgg/t3code) is a web UI over the Claude Code
 # and Codex CLIs installed above. On by default; T3CODE=0 skips it. Like
 # CODEX_LB, skipping means "do not set it up", not "tear it down".
@@ -137,6 +158,11 @@ UNIT="$UNIT_DIR/codex-lb.service"
 OP_ENV="$HOME/.config/op.env"
 T3_HOME="$HOME/.t3"
 T3_STATE="$T3_HOME/runtime/service-state.json"
+T3_SETTINGS="$T3_HOME/userdata/settings.json"
+# opencode and systemd both read XDG_CONFIG_HOME, so these paths follow it.
+OPENCODE_BIN="$HOME/.opencode/bin/opencode"
+OPENCODE_PLUGIN="${XDG_CONFIG_HOME:-$HOME/.config}/opencode/plugins/openrouter-guardrail.js"
+OPENROUTER_ENV="${XDG_CONFIG_HOME:-$HOME/.config}/environment.d/60-openrouter.conf"
 
 log()  { printf '\n\033[1;34m==>\033[0m \033[1m%s\033[0m\n' "$*"; }
 info() { printf '    %s\n' "$*"; }
@@ -202,6 +228,66 @@ prompt_op_token() {
     printf '\n' >/dev/tty
     if [[ "$ans" == [yY]* ]]; then OP_TOKEN="$t"; return 0; fi
   done
+}
+
+# Decide whether an OpenRouter key can be stored. GET /api/v1/key returns the
+# key's own limits and usage and spends no credits. The header goes through
+# stdin, so the key is not in curl's argv, which other local users can read in
+# /proc.
+check_openrouter_key() {
+  local code
+  # bash sources the file this key goes into, and systemd parses it. Other
+  # characters can break either one, or run as a command in every new shell.
+  if [[ ! "$1" =~ ^[A-Za-z0-9_-]+$ ]]; then
+    warn "the OpenRouter key has characters other than letters, digits, '-' and '_'"
+    return 1
+  fi
+  code="$(printf 'Authorization: Bearer %s\n' "$1" \
+    | curl -s -o /dev/null -w '%{http_code}' --max-time 15 -H @- \
+        https://openrouter.ai/api/v1/key || true)"
+  case "$code" in
+    200) return 0 ;;
+    401 | 403) warn "OpenRouter rejected the key (HTTP $code)"; return 1 ;;
+    *) warn "could not check the key with OpenRouter (HTTP ${code:-none}); storing it unchecked"; return 0 ;;
+  esac
+}
+
+# Read an OpenRouter key from the terminal. Same rules as prompt_op_token, but
+# OpenRouter itself confirms the paste, so there is no y/N question.
+prompt_openrouter_key() {
+  local k
+  while :; do
+    printf '\n    Paste the OpenRouter API key (input hidden), or Enter to skip: ' >/dev/tty
+    IFS= read -rs k </dev/tty || true
+    printf '\n' >/dev/tty
+    [[ -z "$k" ]] && return 1
+    if [[ "$k" != sk-or-* ]]; then
+      warn "an OpenRouter API key starts with 'sk-or-' — that looks like the wrong entry"
+      continue
+    fi
+    if check_openrouter_key "$k"; then OR_KEY="$k"; return 0; fi
+  done
+}
+
+# Store the OpenRouter key in an environment.d file, mode 600. The systemd
+# --user manager reads environment.d when it starts and on daemon-reload, and
+# gives the variables to every service it starts after that. ~/.bashrc sources
+# the same file, so interactive shells get the key too.
+write_openrouter_env() {
+  mkdir -p "${OPENROUTER_ENV%/*}"
+  ( umask 077; printf 'OPENROUTER_API_KEY=%s\n' "$1" >"$OPENROUTER_ENV" )
+  # The umask applies only when the file is new.
+  chmod 600 "$OPENROUTER_ENV"
+  bashrc_once '60-openrouter.conf' <<'OR_BASHRC'
+# OPENROUTER_API_KEY for opencode and other OpenRouter clients. systemd --user
+# services read the same file through environment.d.
+if [ -r "${XDG_CONFIG_HOME:-$HOME/.config}/environment.d/60-openrouter.conf" ]; then
+  set -a; . "${XDG_CONFIG_HOME:-$HOME/.config}/environment.d/60-openrouter.conf"; set +a
+fi
+OR_BASHRC
+  export OPENROUTER_API_KEY="$1"
+  systemctl --user daemon-reload
+  OR_WRITTEN=1
 }
 
 # Run a third-party install script safely.
@@ -338,8 +424,10 @@ fi
 
 # bubblewrap is the sandbox backend Codex expects on PATH; without it the
 # app-server falls back to its bundled copy and logs an error on every start.
+# ripgrep: opencode's search tools need rg, and without one on PATH opencode
+# downloads its own copy on first use.
 "${APT[@]}" install -y --no-install-recommends \
-  ca-certificates curl wget git gnupg jq python3 unzip bubblewrap
+  ca-certificates curl wget git gnupg jq python3 unzip bubblewrap ripgrep
 
 "${APT[@]}" autoremove -y
 
@@ -471,6 +559,184 @@ if [[ -n "${ANTHROPIC_API_KEY:-}" ]]; then
   warn "ANTHROPIC_API_KEY is set; it takes precedence over subscription login."
   warn "unset it if you want this box to bill against Pro/Max instead."
 fi
+
+# ---------------------------------------------------------------------------
+# 4c. opencode
+# ---------------------------------------------------------------------------
+# The installer always puts the binary in ~/.opencode/bin. --no-modify-path
+# stops it from editing ~/.bashrc; the symlink below puts opencode in
+# ~/.local/bin next to codex and claude. On a re-run the installer exits early
+# when the installed version is the latest release.
+#   https://opencode.ai/docs/
+log "Installing opencode"
+
+# Without --version the installer asks api.github.com for the latest release.
+# That API allows 60 unauthenticated requests per hour per IP, so it fails
+# behind a busy NAT. The /releases/latest redirect has no such limit; the T3
+# Code step uses it for the same reason. With --version the installer only
+# checks that the tag exists.
+OC_ARGS=(--no-modify-path)
+OC_TAG="$(curl -fsSLI -o /dev/null -w '%{url_effective}' \
+  https://github.com/anomalyco/opencode/releases/latest || true)"
+OC_TAG="${OC_TAG##*/}"
+[[ "$OC_TAG" == v* ]] && OC_ARGS+=(--version "${OC_TAG#v}")
+
+if [[ -x "$OPENCODE_BIN" ]]; then
+  info "found opencode $("$OPENCODE_BIN" --version 2>&1 | head -1) — upgrading in place"
+  run_installer bash https://opencode.ai/install "${OC_ARGS[@]}" \
+    || warn "the opencode installer failed; keeping the installed version"
+else
+  run_installer bash https://opencode.ai/install "${OC_ARGS[@]}" \
+    || die "the opencode installer failed"
+fi
+[[ -x "$OPENCODE_BIN" ]] || die "opencode not found at $OPENCODE_BIN after install"
+
+# A symlink, not a copy: opencode's self-update replaces the file in
+# ~/.opencode/bin. An existing opencode that is not ours is left alone.
+if [[ ! -e "$LOCAL_BIN/opencode" || -L "$LOCAL_BIN/opencode" ]]; then
+  ln -sfn "$OPENCODE_BIN" "$LOCAL_BIN/opencode"
+else
+  warn "$LOCAL_BIN/opencode is not a symlink to $OPENCODE_BIN; leaving it alone"
+fi
+hash -r
+
+# opencode's self-update runs the same installer without --no-modify-path, and
+# the installer then appends this exact line to ~/.bashrc unless the line is
+# already there. Write it here, so that all ~/.bashrc edits come from this
+# script.
+# shellcheck disable=SC2016 # $PATH must expand in ~/.bashrc, not here
+printf 'export PATH=%s:$PATH\n' "${OPENCODE_BIN%/*}" \
+  | bashrc_once "export PATH=${OPENCODE_BIN%/*}:"
+
+# OpenRouter can scan each request for prompt injection. When a guardrail on
+# the API key sets that scan to "block", OpenRouter rejects a request with HTTP
+# 403 if any message matches one of its published regexes. Two matches come
+# from text that opencode writes itself. This plugin rewrites that text in
+# requests to OpenRouter only. The header comment of the plugin has the details.
+# opencode loads *.js and *.ts from this directory. The temporary name has
+# neither suffix, so opencode never loads a partly written file.
+mkdir -p "${OPENCODE_PLUGIN%/*}"
+OC_PLUGIN_TMP="$(mktemp "${OPENCODE_PLUGIN%/*}/.openrouter-guardrail.XXXXXX")"
+cat >"$OC_PLUGIN_TMP" <<'OC_PLUGIN_EOF'
+// opencode plugin installed by aviggiano/setup (setup.sh). A re-run of setup.sh
+// replaces this file, so do not edit it here.
+//
+// OpenRouter can scan each request for prompt injection. When a guardrail on
+// the API key sets that scan to "block", OpenRouter rejects the request with
+// HTTP 403 "Request blocked: prompt injection patterns detected" if any message
+// matches one of its published regexes:
+//   https://openrouter.ai/docs/guides/features/guardrails/prompt-injection
+//
+// Two matches come from text that opencode writes itself:
+//
+// 1. System prompt. Models without a prompt of their own (Qwen, DeepSeek, GLM,
+//    Mistral, Trinity and others) get default.txt or trinity.txt. Both have an
+//    example in which a line ends with "]" and the next line starts with
+//    "user:". That matches role_delimiter_injection:
+//      /\][^\S\n]*\n\s*\[?(system|assistant|user)\]?:/i
+//    Fix: put "." after that "]".
+//
+// 2. Compaction. opencode sends the history as one user message, and labels
+//    each entry "[User]: " or "[Assistant]: ". "[Assistant]" matches
+//    bracketed_role_spoofing, so compaction fails for every model:
+//      /\[\s*(System\s*Message|System|Assistant|Internal)\s*\]/i
+//    A "[User]: " label after a line that ends with "]" also matches
+//    role_delimiter_injection.
+//    Fix: change the labels to "[User turn]: " and "[Assistant turn]: ".
+//    No plugin hook sees this text, so the fix goes in the fetch function of
+//    the openrouter provider.
+//
+// The plugin does not change tool output, file content or user text, and a
+// match there still gets a 403. To stop all of these, set prompt injection
+// detection to "flag" on every guardrail that covers the key. Do not use
+// "redact": it changes the prompt and gives no error.
+//
+// Each hook catches its own errors, because opencode fails the request when a
+// hook throws. If a later opencode release changes these internals, the
+// plugin does nothing and the 403 comes back.
+
+const ROLE_DELIMITER = /\](?=[^\S\n]*\n\s*\[?(?:system|assistant|user)\]?:)/gi
+const COMPACTION_LABEL = /^\[(User|Assistant)\]: /gm
+// The first marker is from opencode's compaction prompt. A plugin that
+// replaces that prompt makes opencode use the second one.
+const COMPACTION_MARKERS = ["<conversation>", "The following is the conversation history:"]
+const WRAPPED = Symbol.for("aviggiano/setup openrouter-guardrail")
+
+const isOpenRouter = (model) =>
+  model?.providerID === "openrouter" || model?.api?.npm === "@openrouter/ai-sdk-provider"
+
+// Rewrite the compaction message in a chat completions request body. Return
+// the body unchanged when there is nothing to rewrite.
+const fixCompaction = (body) => {
+  if (typeof body !== "string" || !COMPACTION_MARKERS.some((m) => body.includes(m))) return body
+  const data = JSON.parse(body)
+  if (!Array.isArray(data?.messages)) return body
+  let changed = false
+  const fix = (text) => {
+    if (!COMPACTION_MARKERS.some((m) => text.includes(m))) return text
+    const next = text.replace(COMPACTION_LABEL, "[$1 turn]: ")
+    if (next !== text) changed = true
+    return next
+  }
+  for (const message of data.messages) {
+    if (message?.role !== "user") continue
+    if (typeof message.content === "string") {
+      message.content = fix(message.content)
+    } else if (Array.isArray(message.content)) {
+      for (const part of message.content) {
+        if (typeof part?.text === "string") part.text = fix(part.text)
+      }
+    }
+  }
+  return changed ? JSON.stringify(data) : body
+}
+
+export const OpenRouterGuardrail = async () => ({
+  // opencode runs this hook before it creates providers, so the fetch function
+  // set here is the one the openrouter provider uses.
+  config: async (cfg) => {
+    try {
+      // With no key and no provider.openrouter entry, OpenRouter is not in use.
+      // An entry made here would make opencode list OpenRouter models anyway.
+      if (!cfg.provider?.openrouter && !process.env.OPENROUTER_API_KEY) return
+      cfg.provider ??= {}
+      cfg.provider.openrouter ??= {}
+      const options = (cfg.provider.openrouter.options ??= {})
+      if (options.fetch?.[WRAPPED]) return
+      const next = typeof options.fetch === "function" ? options.fetch : globalThis.fetch
+      const wrapped = (url, init) => {
+        try {
+          if (typeof init?.body === "string") init = { ...init, body: fixCompaction(init.body) }
+        } catch {
+          // Send the request unchanged.
+        }
+        return next(url, init)
+      }
+      wrapped[WRAPPED] = true
+      options.fetch = wrapped
+    } catch {
+      // Leave the config unchanged.
+    }
+  },
+  "experimental.chat.system.transform": async (input, output) => {
+    try {
+      if (!isOpenRouter(input?.model)) return
+      // Change the array in place. opencode reads its own reference to it, not
+      // a new array assigned to output.system.
+      for (let i = 0; i < output.system.length; i++) {
+        const text = output.system[i]
+        if (typeof text === "string") output.system[i] = text.replace(ROLE_DELIMITER, "].")
+      }
+    } catch {
+      // Send the system prompt unchanged.
+    }
+  },
+})
+OC_PLUGIN_EOF
+chmod 644 "$OC_PLUGIN_TMP"
+mv -f "$OC_PLUGIN_TMP" "$OPENCODE_PLUGIN"
+info "wrote $OPENCODE_PLUGIN"
+info "opencode $("$OPENCODE_BIN" --version 2>&1 | head -1)"
 
 # ---------------------------------------------------------------------------
 # 5. uv
@@ -820,6 +1086,27 @@ T3_SHIM_EOF
     chmod 755 "$T3_SHIM"
   fi
 
+  # T3 Code ships with its OpenCode provider off: on first start it writes
+  # providers.opencode.enabled=false to settings.json by itself, so an existing
+  # false there is not a choice someone made. With the provider off, T3 Code
+  # neither probes for the opencode binary nor lists its models. The server
+  # reads this file when it starts and finds opencode through the PATH of a
+  # login shell, which step 4c set up. jq writes to a temporary file first, so
+  # a failed run cannot leave a truncated settings.json behind.
+  if [[ -x "$OPENCODE_BIN" ]]; then
+    mkdir -p "${T3_SETTINGS%/*}"
+    [[ -s "$T3_SETTINGS" ]] || printf '{}\n' >"$T3_SETTINGS"
+    if [[ "$(jq -r '.providers.opencode.enabled // false' "$T3_SETTINGS")" == "true" ]]; then
+      info "OpenCode is already enabled in T3 Code ($T3_SETTINGS)"
+    else
+      jq '.providers.opencode.enabled = true' "$T3_SETTINGS" >"$TMPWORK/t3-settings.json" \
+        && mv -f "$TMPWORK/t3-settings.json" "$T3_SETTINGS" \
+        && T3_SETTINGS_CHANGED=1 \
+        && info "enabled OpenCode in T3 Code ($T3_SETTINGS)" \
+        || warn "could not enable OpenCode in $T3_SETTINGS; turn it on under Settings > Providers"
+    fi
+  fi
+
   if T3_BIN="$(t3_bin)"; then
     info "$("$T3_BIN" --version 2>&1 | head -1), service $(systemctl --user is-active t3code.service || true)"
   else
@@ -876,6 +1163,50 @@ elif [[ $HAVE_TTY -eq 1 ]]; then
   fi
 else
   info "op: no token supplied — set OP_SERVICE_ACCOUNT_TOKEN, or re-run with a terminal"
+fi
+
+# --- 10e. OpenRouter API key ----------------------------------------------
+# Before the terminal gate for the same reason as 10d: a key in the
+# environment needs no terminal. Unlike the 1Password token, a key in the
+# environment replaces a stored one, so a provisioner can rotate the key by
+# re-running this script with the new one.
+OR_STORED=""
+[[ -r "$OPENROUTER_ENV" ]] \
+  && OR_STORED="$(sed -n 's/^OPENROUTER_API_KEY=//p' "$OPENROUTER_ENV" | tail -n 1)"
+if [[ "$OPENROUTER_AUTH" == "skip" ]]; then
+  info "openrouter: OPENROUTER_AUTH=skip — not configuring OPENROUTER_API_KEY"
+elif [[ "$OPENROUTER_AUTH" == "auto" && -n "${OPENROUTER_API_KEY:-}" ]]; then
+  if [[ "$OPENROUTER_API_KEY" == "$OR_STORED" ]]; then
+    info "openrouter: key already stored ($OPENROUTER_ENV)"
+  elif check_openrouter_key "$OPENROUTER_API_KEY"; then
+    write_openrouter_env "$OPENROUTER_API_KEY"
+    info "openrouter: key taken from the environment, stored in $OPENROUTER_ENV (mode 600)"
+  else
+    warn "openrouter: the key in OPENROUTER_API_KEY was not stored"
+  fi
+elif [[ "$OPENROUTER_AUTH" == "auto" && -n "$OR_STORED" ]]; then
+  info "openrouter: key already stored ($OPENROUTER_ENV)"
+elif [[ $HAVE_TTY -eq 1 ]]; then
+  if prompt_openrouter_key; then
+    write_openrouter_env "$OR_KEY"
+    unset OR_KEY
+    info "openrouter: key stored in $OPENROUTER_ENV (mode 600) and sourced from ~/.bashrc"
+  elif [[ -n "$OR_STORED" ]]; then
+    info "openrouter: no new key; kept the stored one ($OPENROUTER_ENV)"
+  else
+    warn "no key stored; opencode cannot use OpenRouter until OPENROUTER_API_KEY is set"
+  fi
+else
+  info "openrouter: no key supplied — set OPENROUTER_API_KEY, or re-run with a terminal"
+fi
+# A running service keeps the environment it started with and reads
+# settings.json once at startup. Do not restart T3 Code from here: this script
+# can itself run in a T3 Code terminal.
+if [[ "${OR_WRITTEN:-0}" == 1 || "${T3_SETTINGS_CHANGED:-0}" == 1 ]] \
+  && systemctl --user is-active --quiet t3code.service; then
+  info "T3 Code was already running; restart it to pick up the OpenRouter key"
+  info "and the OpenCode provider setting:"
+  info "    systemctl --user restart t3code"
 fi
 
 if [[ $HAVE_TTY -eq 0 ]]; then
@@ -1100,6 +1431,7 @@ cat <<SUMMARY
                   elif codex login status >/dev/null 2>&1; then echo 'signed in'
                   else echo 'NOT signed in'; fi))
     claude      $(claude --version 2>&1 | head -1)  ($([[ -s "$CLAUDE_CREDS" ]] && echo 'signed in' || echo 'NOT signed in'))
+    opencode    $("$OPENCODE_BIN" --version 2>&1 </dev/null | head -1)  ($([[ -s "$OPENROUTER_ENV" ]] && echo 'OpenRouter key stored' || echo 'no OpenRouter key — re-run with OPENROUTER_API_KEY set'))
     op          $(op --version 2>&1 | head -1)  ($([[ -s "$OP_ENV" ]] && echo 'token stored' || echo 'no token — OP_AUTH=auto to add one'))
     t3          ${T3_STATUS}
     codex-lb    ${LB_STATUS}
@@ -1112,9 +1444,14 @@ cat <<SUMMARY
     2. Pair the Codex app with this machine (prints a short-lived code):
            codex remote-control pair
 ${T3_PAIR_STEP}
-    4. Verify Codex works:
+    4. Verify Codex and opencode work:
            codex doctor
            codex exec 'say hi'
+           opencode models openrouter | head
+           opencode run -m openrouter/<model from the list> 'say hi'
+       If OpenRouter answers 403 "Request blocked: prompt injection patterns
+       detected", set prompt injection detection to "flag" on the guardrails
+       that cover the key. The opencode plugin only fixes opencode's own text.
 
     5. See which credentials this machine can reach (no names are baked in —
        ask 1Password, so a credential added to the vault later just shows up;
@@ -1129,7 +1466,7 @@ ${T3_PAIR_STEP}
        codex app-server daemon restart
        tail -f ~/.codex/app-server-control/app-server.log
 
-    Note: 'codex', 'claude', 'uv' and 't3' live in ~/.local/bin — run 'exec \$SHELL -l'
+    Note: 'codex', 'claude', 'opencode', 'uv' and 't3' live in ~/.local/bin — run 'exec \$SHELL -l'
     or open a new shell if this was a first-time install.
 SUMMARY
 
