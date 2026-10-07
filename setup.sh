@@ -13,7 +13,8 @@
 #   * opencode                 via https://opencode.ai/install, plus a plugin
 #                              that stops OpenRouter's prompt-injection
 #                              guardrail from blocking opencode's own prompts
-#   * T3 Code (default on)     release tarball + its systemd --user service
+#   * T3 Code (default on)     release tarball + its systemd --user service,
+#                              with its OpenCode provider switched on
 #   * OPENROUTER_API_KEY       from the environment or a prompt, for opencode
 #                              and the systemd --user services (T3 Code)
 #   * sign-in                  gh, Codex (device auth, when codex-lb is off),
@@ -157,6 +158,7 @@ UNIT="$UNIT_DIR/codex-lb.service"
 OP_ENV="$HOME/.config/op.env"
 T3_HOME="$HOME/.t3"
 T3_STATE="$T3_HOME/runtime/service-state.json"
+T3_SETTINGS="$T3_HOME/userdata/settings.json"
 # opencode and systemd both read XDG_CONFIG_HOME, so these paths follow it.
 OPENCODE_BIN="$HOME/.opencode/bin/opencode"
 OPENCODE_PLUGIN="${XDG_CONFIG_HOME:-$HOME/.config}/opencode/plugins/openrouter-guardrail.js"
@@ -1084,6 +1086,27 @@ T3_SHIM_EOF
     chmod 755 "$T3_SHIM"
   fi
 
+  # T3 Code ships with its OpenCode provider off: on first start it writes
+  # providers.opencode.enabled=false to settings.json by itself, so an existing
+  # false there is not a choice someone made. With the provider off, T3 Code
+  # neither probes for the opencode binary nor lists its models. The server
+  # reads this file when it starts and finds opencode through the PATH of a
+  # login shell, which step 4c set up. jq writes to a temporary file first, so
+  # a failed run cannot leave a truncated settings.json behind.
+  if [[ -x "$OPENCODE_BIN" ]]; then
+    mkdir -p "${T3_SETTINGS%/*}"
+    [[ -s "$T3_SETTINGS" ]] || printf '{}\n' >"$T3_SETTINGS"
+    if [[ "$(jq -r '.providers.opencode.enabled // false' "$T3_SETTINGS")" == "true" ]]; then
+      info "OpenCode is already enabled in T3 Code ($T3_SETTINGS)"
+    else
+      jq '.providers.opencode.enabled = true' "$T3_SETTINGS" >"$TMPWORK/t3-settings.json" \
+        && mv -f "$TMPWORK/t3-settings.json" "$T3_SETTINGS" \
+        && T3_SETTINGS_CHANGED=1 \
+        && info "enabled OpenCode in T3 Code ($T3_SETTINGS)" \
+        || warn "could not enable OpenCode in $T3_SETTINGS; turn it on under Settings > Providers"
+    fi
+  fi
+
   if T3_BIN="$(t3_bin)"; then
     info "$("$T3_BIN" --version 2>&1 | head -1), service $(systemctl --user is-active t3code.service || true)"
   else
@@ -1176,10 +1199,13 @@ elif [[ $HAVE_TTY -eq 1 ]]; then
 else
   info "openrouter: no key supplied — set OPENROUTER_API_KEY, or re-run with a terminal"
 fi
-# A running service keeps the environment it started with. Do not restart T3
-# Code from here: this script can itself run in a T3 Code terminal.
-if [[ "${OR_WRITTEN:-0}" == 1 ]] && systemctl --user is-active --quiet t3code.service; then
-  info "T3 Code was already running; restart it to give its agents the key:"
+# A running service keeps the environment it started with and reads
+# settings.json once at startup. Do not restart T3 Code from here: this script
+# can itself run in a T3 Code terminal.
+if [[ "${OR_WRITTEN:-0}" == 1 || "${T3_SETTINGS_CHANGED:-0}" == 1 ]] \
+  && systemctl --user is-active --quiet t3code.service; then
+  info "T3 Code was already running; restart it to pick up the OpenRouter key"
+  info "and the OpenCode provider setting:"
   info "    systemctl --user restart t3code"
 fi
 
