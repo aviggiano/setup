@@ -307,6 +307,14 @@ op_secret() {
   return 1
 }
 
+# True only when the vault was listed successfully and has no item titled $1.
+# A failed listing (network, rate limit) is not proof the item is gone.
+op_item_missing() {
+  local titles
+  titles="$(op item list --vault "$OP_VAULT" --format json 2>/dev/null)" || return 1
+  ! jq -e --arg t "$1" 'any(.[]; .title == $t)' <<<"$titles" >/dev/null
+}
+
 # Store the OpenRouter key in an environment.d file, mode 600. The systemd
 # --user manager reads environment.d when it starts and on daemon-reload, and
 # gives the variables to every service it starts after that. ~/.bashrc sources
@@ -1169,19 +1177,20 @@ fi
 # host. A re-run downloads only when the manifest names a newer version.
 #
 # The service runs `hob --headless` in the foreground; --detach is for a shell,
-# where it forks away from the terminal. hob listens on 127.0.0.1 only, and the
-# desktop app reaches it through an SSH tunnel it opens itself.
+# where it forks away from the terminal. Desktop connections are pinned to
+# localhost below (2.4.1's default, made explicit so a changed default cannot
+# expose it); the desktop app reaches it through an SSH tunnel it opens itself.
 #   https://hob.dev
 if [[ "$HOB" == "1" ]]; then
 
   log "Installing hob (https://hob.dev)"
 
-  # The Linux build links GTK 3 and ALSA even when headless, and stops to ask
-  # to install them when they are missing. libasound2 became libasound2t64 in
-  # Ubuntu 24.04 and Debian 13.
+  # The Linux build needs GTK 3, NSS and ALSA even when headless, and stops to
+  # ask to install them when they are missing. libasound2 became libasound2t64
+  # in Ubuntu 24.04 and Debian 13.
   HOB_ALSA=libasound2t64
   apt-cache show "$HOB_ALSA" >/dev/null 2>&1 || HOB_ALSA=libasound2
-  "${APT[@]}" install -y --no-install-recommends libgtk-3-0 "$HOB_ALSA"
+  "${APT[@]}" install -y --no-install-recommends libgtk-3-0 libnss3 "$HOB_ALSA"
 
   case "$(dpkg --print-architecture)" in
     amd64) HOB_ARCH=amd64 ;;
@@ -1199,8 +1208,11 @@ if [[ "$HOB" == "1" ]]; then
     [[ -n "$HOB_VERSION" && -n "$HOB_URL" && -n "$HOB_SHA" ]] \
       || die "the hob manifest has no linux-$HOB_ARCH release"
     HOB_INSTALLED="$("$HOB_BIN" app version 2>/dev/null </dev/null || true)"
-    if [[ "$HOB_INSTALLED" == "$HOB_VERSION" ]]; then
-      info "hob $HOB_VERSION is already the latest"
+    # Replace only a missing or older hob: a beta build, or a stable release
+    # the manifest has since rolled back, is left alone rather than downgraded.
+    if [[ -n "$HOB_INSTALLED" ]] \
+      && [[ "$(printf '%s\n%s\n' "$HOB_VERSION" "$HOB_INSTALLED" | sort -V | tail -n 1)" == "$HOB_INSTALLED" ]]; then
+      info "hob $HOB_INSTALLED is current (stable: $HOB_VERSION)"
     else
       info "installing hob $HOB_VERSION${HOB_INSTALLED:+ (replacing $HOB_INSTALLED)}"
       curl -fsSL "$HOB_URL" -o "$TMPWORK/hob" || die "could not download $HOB_URL"
@@ -1238,6 +1250,34 @@ HOB_UNIT_EOF
       HOB_UPGRADED=1
     fi
     systemctl --user enable hob.service >/dev/null 2>&1
+    # A Host started by hand (`hob --headless --detach`) keeps running outside
+    # the unit, and a second `hob --headless` only attaches to it, so the unit
+    # would never own the Host. Stop it first — unless this script runs inside
+    # it, in which case that would kill this run.
+    if ! systemctl --user is-active --quiet hob.service; then
+      HOB_STRAY=()
+      for pid in $(pgrep -u "$USER" -x hob || true); do
+        grep -qs '/hob\.service$' "/proc/$pid/cgroup" || HOB_STRAY+=("$pid")
+      done
+      if (( ${#HOB_STRAY[@]} )); then
+        HOB_ANCESTOR=0 pid=$$
+        while [[ "$pid" -gt 1 ]]; do
+          [[ " ${HOB_STRAY[*]} " == *" $pid "* ]] && HOB_ANCESTOR=1
+          pid="$(ps -o ppid= -p "$pid" | tr -d ' ')"
+        done
+        if [[ $HOB_ANCESTOR -eq 1 ]]; then
+          warn "hob is already running outside systemd, and this script runs inside it."
+          warn "after this finishes, quit that hob and run: systemctl --user start hob"
+        else
+          info "stopping a hob started outside systemd (pid ${HOB_STRAY[*]})"
+          kill -TERM "${HOB_STRAY[@]}" 2>/dev/null || true
+          for _ in $(seq 1 15); do
+            pgrep -u "$USER" -x hob >/dev/null || break
+            sleep 1
+          done
+        fi
+      fi
+    fi
     # A terminal or agent inside hob is a child of the service, so restarting
     # it from there would kill this script mid-run (T3 Code has the same rule).
     if [[ "${HOB_UPGRADED:-0}" == 1 ]] && grep -qs '/hob\.service$' /proc/self/cgroup; then
@@ -1248,7 +1288,14 @@ HOB_UNIT_EOF
     else
       systemctl --user start hob.service
     fi
-    info "hob $("$HOB_BIN" app version 2>/dev/null </dev/null), service $(systemctl --user is-active hob.service || true)"
+    # The Host takes a few seconds to answer after a (re)start.
+    for _ in $(seq 1 30); do
+      "$HOB_BIN" connection desktop </dev/null >/dev/null 2>&1 && break
+      sleep 1
+    done
+    "$HOB_BIN" connection desktop localhost </dev/null >/dev/null 2>&1 \
+      || warn "could not restrict hob desktop connections to localhost; check: hob connection desktop"
+    info "hob $("$HOB_BIN" app version 2>/dev/null </dev/null), service $(systemctl --user is-active hob.service || true), $("$HOB_BIN" connection desktop </dev/null 2>/dev/null | head -n 1)"
   fi
 
 else
@@ -1286,13 +1333,20 @@ CLAUDE_CREDS="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/.credentials.json"
 # unattended `OP_SERVICE_ACCOUNT_TOKEN=... bash setup.sh` work end to end.
 if [[ "$OP_AUTH" == "skip" ]]; then
   info "op: OP_AUTH=skip — not configuring 1Password"
+elif [[ -n "${OP_SERVICE_ACCOUNT_TOKEN:-}" && "$OP_AUTH" != "prompt" ]]; then
+  # A token in the environment wins over the stored one, so a provisioner can
+  # rotate it. ~/.bashrc sources op.env, so it is often the same token.
+  # shellcheck source=/dev/null
+  if [[ "$( [[ -r "$OP_ENV" ]] && . "$OP_ENV"; printf '%s' "${OP_SERVICE_ACCOUNT_TOKEN:-}")" == "$OP_SERVICE_ACCOUNT_TOKEN" && -s "$OP_ENV" ]]; then
+    info "op: token already present ($OP_ENV)"
+  else
+    write_op_env "$OP_SERVICE_ACCOUNT_TOKEN"
+    info "op: token taken from the environment, stored in $OP_ENV (mode 600)"
+  fi
 elif [[ -s "$OP_ENV" && "$OP_AUTH" != "prompt" ]]; then
   # shellcheck source=/dev/null
   . "$OP_ENV"
   info "op: token already present ($OP_ENV)"
-elif [[ -n "${OP_SERVICE_ACCOUNT_TOKEN:-}" && "$OP_AUTH" != "prompt" ]]; then
-  write_op_env "$OP_SERVICE_ACCOUNT_TOKEN"
-  info "op: token taken from the environment, stored in $OP_ENV (mode 600)"
 elif [[ $HAVE_TTY -eq 1 ]]; then
   if prompt_op_token; then
     write_op_env "$OP_TOKEN"
@@ -1335,8 +1389,20 @@ elif OR_KEY="$(op_secret OPENROUTER_API_KEY)"; then
     warn "openrouter: the key in 1Password (OPENROUTER_API_KEY) was not stored"
   fi
   unset OR_KEY
+elif op_item_missing OPENROUTER_API_KEY; then
+  # The vault answered and the item is gone: 1Password is the source of truth,
+  # so deleting the item revokes this machine's copy too.
+  if [[ -n "$OR_STORED" ]]; then
+    rm -f "$OPENROUTER_ENV"
+    unset OPENROUTER_API_KEY
+    systemctl --user daemon-reload
+    OR_WRITTEN=1
+    warn "openrouter: no item OPENROUTER_API_KEY in vault '$OP_VAULT' — removed the stored key"
+  else
+    warn "openrouter: no item OPENROUTER_API_KEY in vault '$OP_VAULT'"
+  fi
 else
-  warn "openrouter: no item OPENROUTER_API_KEY in vault '$OP_VAULT'${OR_STORED:+; kept the stored key}"
+  warn "openrouter: could not read OPENROUTER_API_KEY from 1Password${OR_STORED:+; kept the stored key}"
 fi
 
 # --- 10f. hob license -----------------------------------------------------
@@ -1368,6 +1434,18 @@ if [[ "${OR_WRITTEN:-0}" == 1 || "${T3_SETTINGS_CHANGED:-0}" == 1 ]] \
   info "T3 Code was already running; restart it to pick up the OpenRouter key"
   info "and the OpenCode provider setting:"
   info "    systemctl --user restart t3code"
+fi
+# hob's agents (opencode among them) inherit hob's environment, which it got
+# when step 9c started it — before the key above was written. Restart it so
+# they see the new key, unless this script runs inside hob.
+if [[ "${OR_WRITTEN:-0}" == 1 ]] && systemctl --user is-active --quiet hob.service; then
+  if grep -qs '/hob\.service$' /proc/self/cgroup; then
+    info "hob is running this script; restart it afterwards to pick up the OpenRouter key:"
+    info "    systemctl --user restart hob"
+  else
+    systemctl --user restart hob.service
+    info "restarted hob so its agents pick up the OpenRouter key"
+  fi
 fi
 
 if [[ $HAVE_TTY -eq 0 ]]; then
