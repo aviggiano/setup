@@ -15,8 +15,12 @@
 #                              guardrail from blocking opencode's own prompts
 #   * T3 Code (default on)     release tarball + its systemd --user service,
 #                              with its OpenCode provider switched on
-#   * OPENROUTER_API_KEY       from the environment or a prompt, for opencode
-#                              and the systemd --user services (T3 Code)
+#   * hob (default on)         verified release binary + a systemd --user
+#                              service running `hob --headless`
+#   * secrets from 1Password   a service account token is the one secret you
+#                              supply; OPENROUTER_API_KEY (for opencode and the
+#                              systemd --user services) and the hob license
+#                              key are read from its vault with `op`
 #   * sign-in                  gh, Codex (device auth, when codex-lb is off),
 #                              then Claude Code — interactive, last, in series
 #
@@ -48,17 +52,22 @@
 #                                                         (default: 1)
 #   T3_PAIR_TTL       lifetime of the T3 Code pairing token printed at the end
 #                     when Tailscale is up                (default: 15m)
-#   OP_AUTH           skip (default) | auto | prompt — auto stores
+#   HOB               0 to skip installing hob and its service
+#                                                         (default: 1)
+#   OP_AUTH           auto (default) | prompt | skip — auto stores
 #                     OP_SERVICE_ACCOUNT_TOKEN or prompts for one
 #   OP_SERVICE_ACCOUNT_TOKEN
 #                     1Password service account token; when set it is stored
 #                     without prompting, which is how an automated provisioner
 #                     should pass it.
-#   OPENROUTER_AUTH   auto (default) | prompt | skip — auto stores
-#                     OPENROUTER_API_KEY or prompts for one
-#   OPENROUTER_API_KEY
-#                     OpenRouter API key; when set it is stored without
-#                     prompting, and it replaces a key stored by an earlier run.
+#   OP_VAULT          vault the secrets below are read from
+#                     (default: the only vault the token can see)
+#
+# Secrets read from 1Password, by item title, from the item's "credential"
+# field (an API Credential item) or else its "password" field:
+#   OPENROUTER_API_KEY  OpenRouter API key for opencode and T3 Code; re-running
+#                       after changing it in the vault rotates the stored copy
+#   HOB_LICENSE_KEY     hob license key, activated when hob has no license
 #
 # Steps 1-9 are unattended. Step 10 signs you in and needs a *terminal* — but
 # not a terminal on stdin. `curl | bash` makes this script stdin, so sign-in
@@ -115,25 +124,18 @@ case "$CLAUDE_AUTH" in
   *) printf 'CLAUDE_AUTH must be login, token or skip (got: %s)\n' "$CLAUDE_AUTH" >&2; exit 1 ;;
 esac
 # skip   = leave 1Password alone (the op binary is still installed)
-# auto   = use OP_SERVICE_ACCOUNT_TOKEN if set, else prompt when a terminal exists
+# auto   = use OP_SERVICE_ACCOUNT_TOKEN if set, else the stored token, else
+#          prompt when a terminal exists
 # prompt = always ask, even if the variable is already set
-# Off by default: most boxes never get a service account, and the prompt was one
-# more thing to press Enter through on every fresh install.
-OP_AUTH="${OP_AUTH:-skip}"
+# On by default: every other secret this script needs is read from 1Password,
+# so without a token opencode has no OpenRouter key and hob no license.
+OP_AUTH="${OP_AUTH:-auto}"
 case "$OP_AUTH" in
   auto | prompt | skip) ;;
   *) printf 'OP_AUTH must be auto, prompt or skip (got: %s)\n' "$OP_AUTH" >&2; exit 1 ;;
 esac
-# auto   = use OPENROUTER_API_KEY if set, else keep the stored key, else prompt
-#          when a terminal exists
-# prompt = always ask, even if a key is set or stored
-# skip   = leave the stored key alone and do not ask
-# On by default, unlike OP_AUTH: opencode has no OpenRouter access without it.
-OPENROUTER_AUTH="${OPENROUTER_AUTH:-auto}"
-case "$OPENROUTER_AUTH" in
-  auto | prompt | skip) ;;
-  *) printf 'OPENROUTER_AUTH must be auto, prompt or skip (got: %s)\n' "$OPENROUTER_AUTH" >&2; exit 1 ;;
-esac
+# Empty means "the only vault the token can see"; see op_vault.
+OP_VAULT="${OP_VAULT:-}"
 # T3 Code (https://github.com/pingdotgg/t3code) is a web UI over the Claude Code
 # and Codex CLIs installed above. On by default; T3CODE=0 skips it. Like
 # CODEX_LB, skipping means "do not set it up", not "tear it down".
@@ -145,6 +147,14 @@ case "$T3CODE" in
 esac
 # t3's default is 5m, which is gone before you have read the summary it follows.
 T3_PAIR_TTL="${T3_PAIR_TTL:-15m}"
+# hob (https://hob.dev) runs headless here so its desktop app can connect over
+# SSH. On by default; HOB=0 skips it, and like T3CODE does not tear it down.
+HOB="${HOB:-1}"
+case "$HOB" in
+  1 | true | yes) HOB=1 ;;
+  0 | false | no) HOB=0 ;;
+  *) printf 'HOB must be 0 or 1 (got: %s)\n' "$HOB" >&2; exit 1 ;;
+esac
 
 # Non-login shells (cron, `ssh host 'cmd'`, `docker exec`) often do not export
 # USER, and `set -u` turns that into a hard failure. HOME is set by PAM/sshd in
@@ -163,6 +173,8 @@ T3_SETTINGS="$T3_HOME/userdata/settings.json"
 OPENCODE_BIN="$HOME/.opencode/bin/opencode"
 OPENCODE_PLUGIN="${XDG_CONFIG_HOME:-$HOME/.config}/opencode/plugins/openrouter-guardrail.js"
 OPENROUTER_ENV="${XDG_CONFIG_HOME:-$HOME/.config}/environment.d/60-openrouter.conf"
+HOB_BIN="$LOCAL_BIN/hob"
+HOB_UNIT="$UNIT_DIR/hob.service"
 
 log()  { printf '\n\033[1;34m==>\033[0m \033[1m%s\033[0m\n' "$*"; }
 info() { printf '    %s\n' "$*"; }
@@ -186,6 +198,8 @@ bashrc_once() {
 write_op_env() {
   mkdir -p "$HOME/.config"
   ( umask 077; printf 'export OP_SERVICE_ACCOUNT_TOKEN=%q\n' "$1" >"$OP_ENV" )
+  # The secret lookups later in this run need it too.
+  export OP_SERVICE_ACCOUNT_TOKEN="$1"
   bashrc_once 'op.env' <<'OP_BASHRC'
 # The service account token in op.env is the only secret stored on this machine.
 # Every other credential lives in 1Password and is fetched on demand.
@@ -252,21 +266,53 @@ check_openrouter_key() {
   esac
 }
 
-# Read an OpenRouter key from the terminal. Same rules as prompt_op_token, but
-# OpenRouter itself confirms the paste, so there is no y/N question.
-prompt_openrouter_key() {
-  local k
-  while :; do
-    printf '\n    Paste the OpenRouter API key (input hidden), or Enter to skip: ' >/dev/tty
-    IFS= read -rs k </dev/tty || true
-    printf '\n' >/dev/tty
-    [[ -z "$k" ]] && return 1
-    if [[ "$k" != sk-or-* ]]; then
-      warn "an OpenRouter API key starts with 'sk-or-' — that looks like the wrong entry"
-      continue
+# The vault secrets are read from: OP_VAULT, or else the only vault the token
+# can see. A service account is granted specific vaults, so one vault is the
+# usual case and naming it would be one more thing to keep in sync. With
+# several, guessing could read the wrong item, so that needs OP_VAULT.
+# Sets OP_VAULT rather than printing it, so call it in this shell, not in
+# $(...), or the answer is lost and every lookup lists the vaults again.
+op_vault() {
+  local vaults n
+  if [[ -z "$OP_VAULT" ]]; then
+    # A rejected token fails here first; say so instead of "no vaults".
+    if ! vaults="$(op vault list --format json 2>&1)"; then
+      warn "op: could not list vaults — $(head -n 1 <<<"$vaults")"
+      warn "op: to replace the stored token: OP_AUTH=prompt ./setup.sh"
+      return 1
     fi
-    if check_openrouter_key "$k"; then OR_KEY="$k"; return 0; fi
+    vaults="$(jq -r '.[].name' <<<"$vaults")"
+    n="$(grep -c . <<<"$vaults" || true)"
+    case "$n" in
+      1) OP_VAULT="$vaults" ;;
+      0) warn "op: the service account token cannot see any vault"; return 1 ;;
+      *) warn "op: the token can see $n vaults ($(tr '\n' ' ' <<<"$vaults")) — set OP_VAULT to pick one"
+         return 1 ;;
+    esac
+  fi
+}
+
+# Print the secret stored in the item titled $1. API Credential items keep it
+# in "credential", Password items in "password"; try both so either item type
+# works. Nothing reaches argv but the reference, and nothing reaches the log.
+op_secret() {
+  local field v
+  [[ -n "${OP_SERVICE_ACCOUNT_TOKEN:-}" ]] && op_vault || return 1
+  for field in credential password; do
+    if v="$(op read --no-newline "op://$OP_VAULT/$1/$field" 2>/dev/null)" && [[ -n "$v" ]]; then
+      printf '%s' "$v"
+      return 0
+    fi
   done
+  return 1
+}
+
+# True only when the vault was listed successfully and has no item titled $1.
+# A failed listing (network, rate limit) is not proof the item is gone.
+op_item_missing() {
+  local titles
+  titles="$(op item list --vault "$OP_VAULT" --format json 2>/dev/null)" || return 1
+  ! jq -e --arg t "$1" 'any(.[]; .title == $t)' <<<"$titles" >/dev/null
 }
 
 # Store the OpenRouter key in an environment.d file, mode 600. The systemd
@@ -1120,6 +1166,145 @@ else
 
 fi
 
+# ---------------------------------------------------------------------------
+# 9c. hob — install and background service   (default on: HOB=0 skips)
+# ---------------------------------------------------------------------------
+# hob's installer (get.hob.dev/install) downloads a binary and runs it, and the
+# binary copies itself to ~/.local/bin/hob. The installer only compares the
+# file size with the manifest; the manifest also carries a sha256, so this
+# reads the manifest itself and checks that instead. The hash comes from the
+# same host as the binary: it catches a corrupt download, not a compromised
+# host. A re-run downloads only when the manifest names a newer version.
+#
+# The service runs `hob --headless` in the foreground; --detach is for a shell,
+# where it forks away from the terminal. Desktop connections are pinned to
+# localhost below (2.4.1's default, made explicit so a changed default cannot
+# expose it); the desktop app reaches it through an SSH tunnel it opens itself.
+#   https://hob.dev
+if [[ "$HOB" == "1" ]]; then
+
+  log "Installing hob (https://hob.dev)"
+
+  # The Linux build needs GTK 3, NSS and ALSA even when headless, and stops to
+  # ask to install them when they are missing. libasound2 became libasound2t64
+  # in Ubuntu 24.04 and Debian 13.
+  HOB_ALSA=libasound2t64
+  apt-cache show "$HOB_ALSA" >/dev/null 2>&1 || HOB_ALSA=libasound2
+  "${APT[@]}" install -y --no-install-recommends libgtk-3-0 libnss3 "$HOB_ALSA"
+
+  case "$(dpkg --print-architecture)" in
+    amd64) HOB_ARCH=amd64 ;;
+    arm64) HOB_ARCH=arm64 ;;
+    *)     HOB_ARCH="" ;;
+  esac
+  if [[ -z "$HOB_ARCH" ]]; then
+    warn "no hob build for $(dpkg --print-architecture); skipping"
+  elif ! curl -fsSL https://get.hob.dev/updates/stable/manifest.json -o "$TMPWORK/hob-manifest.json"; then
+    warn "could not download the hob release manifest; skipping"
+  else
+    HOB_VERSION="$(jq -r '.version // empty' "$TMPWORK/hob-manifest.json")"
+    HOB_URL="$(jq -r --arg p "linux-$HOB_ARCH" '.platforms[$p].url // empty' "$TMPWORK/hob-manifest.json")"
+    HOB_SHA="$(jq -r --arg p "linux-$HOB_ARCH" '.platforms[$p].sha256 // empty' "$TMPWORK/hob-manifest.json")"
+    [[ -n "$HOB_VERSION" && -n "$HOB_URL" && -n "$HOB_SHA" ]] \
+      || die "the hob manifest has no linux-$HOB_ARCH release"
+    HOB_INSTALLED="$("$HOB_BIN" app version 2>/dev/null </dev/null || true)"
+    # Replace only a missing or older hob: a beta build, or a stable release
+    # the manifest has since rolled back, is left alone rather than downgraded.
+    if [[ -n "$HOB_INSTALLED" ]] \
+      && [[ "$(printf '%s\n%s\n' "$HOB_VERSION" "$HOB_INSTALLED" | sort -V | tail -n 1)" == "$HOB_INSTALLED" ]]; then
+      info "hob $HOB_INSTALLED is current (stable: $HOB_VERSION)"
+    else
+      info "installing hob $HOB_VERSION${HOB_INSTALLED:+ (replacing $HOB_INSTALLED)}"
+      curl -fsSL "$HOB_URL" -o "$TMPWORK/hob" || die "could not download $HOB_URL"
+      echo "$HOB_SHA  $TMPWORK/hob" | sha256sum -c --quiet - \
+        || die "checksum mismatch for $HOB_URL"
+      chmod +x "$TMPWORK/hob"
+      "$TMPWORK/hob" </dev/null || die "the hob installer failed"
+      [[ -x "$HOB_BIN" ]] || die "hob not found at $HOB_BIN after install"
+      HOB_UPGRADED=1
+    fi
+  fi
+
+  if [[ -x "$HOB_BIN" ]]; then
+    # Rewritten every run, so a change here reaches existing boxes; restarted
+    # only when the unit or the binary changed.
+    cat >"$TMPWORK/hob.service" <<'HOB_UNIT_EOF'
+[Unit]
+Description=hob headless host (added by aviggiano/setup)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/hob --headless
+Restart=on-failure
+RestartSec=5
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+
+[Install]
+WantedBy=default.target
+HOB_UNIT_EOF
+    if ! cmp -s "$TMPWORK/hob.service" "$HOB_UNIT"; then
+      mv -f "$TMPWORK/hob.service" "$HOB_UNIT"
+      systemctl --user daemon-reload
+      HOB_UPGRADED=1
+    fi
+    systemctl --user enable hob.service >/dev/null 2>&1
+    # A Host started by hand (`hob --headless --detach`) keeps running outside
+    # the unit, and a second `hob --headless` only attaches to it, so the unit
+    # would never own the Host. Stop it first — unless this script runs inside
+    # it, in which case that would kill this run.
+    if ! systemctl --user is-active --quiet hob.service; then
+      HOB_STRAY=()
+      for pid in $(pgrep -u "$USER" -x hob || true); do
+        grep -qs '/hob\.service$' "/proc/$pid/cgroup" || HOB_STRAY+=("$pid")
+      done
+      if (( ${#HOB_STRAY[@]} )); then
+        HOB_ANCESTOR=0 pid=$$
+        while [[ "$pid" -gt 1 ]]; do
+          [[ " ${HOB_STRAY[*]} " == *" $pid "* ]] && HOB_ANCESTOR=1
+          pid="$(ps -o ppid= -p "$pid" | tr -d ' ')"
+        done
+        if [[ $HOB_ANCESTOR -eq 1 ]]; then
+          warn "hob is already running outside systemd, and this script runs inside it."
+          warn "after this finishes, quit that hob and run: systemctl --user start hob"
+        else
+          info "stopping a hob started outside systemd (pid ${HOB_STRAY[*]})"
+          kill -TERM "${HOB_STRAY[@]}" 2>/dev/null || true
+          for _ in $(seq 1 15); do
+            pgrep -u "$USER" -x hob >/dev/null || break
+            sleep 1
+          done
+        fi
+      fi
+    fi
+    # A terminal or agent inside hob is a child of the service, so restarting
+    # it from there would kill this script mid-run (T3 Code has the same rule).
+    if [[ "${HOB_UPGRADED:-0}" == 1 ]] && grep -qs '/hob\.service$' /proc/self/cgroup; then
+      info "running inside hob — not restarting it; when this finishes, run:"
+      info "    systemctl --user restart hob"
+    elif [[ "${HOB_UPGRADED:-0}" == 1 ]]; then
+      systemctl --user restart hob.service
+    else
+      systemctl --user start hob.service
+    fi
+    # The Host takes a few seconds to answer after a (re)start.
+    for _ in $(seq 1 30); do
+      "$HOB_BIN" connection desktop </dev/null >/dev/null 2>&1 && break
+      sleep 1
+    done
+    "$HOB_BIN" connection desktop localhost </dev/null >/dev/null 2>&1 \
+      || warn "could not restrict hob desktop connections to localhost; check: hob connection desktop"
+    info "hob $("$HOB_BIN" app version 2>/dev/null </dev/null), service $(systemctl --user is-active hob.service || true), $("$HOB_BIN" connection desktop </dev/null 2>/dev/null | head -n 1)"
+  fi
+
+else
+
+  log "hob"
+  info "HOB=0 — skipping"
+
+fi
+
 # codex-lb being *on the box* is not the same as CODEX_LB=1: step 7 skips
 # rather than uninstalls, so a machine provisioned by an earlier run still has
 # the service, still has config.toml pointing at it, and still has the
@@ -1148,11 +1333,20 @@ CLAUDE_CREDS="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/.credentials.json"
 # unattended `OP_SERVICE_ACCOUNT_TOKEN=... bash setup.sh` work end to end.
 if [[ "$OP_AUTH" == "skip" ]]; then
   info "op: OP_AUTH=skip — not configuring 1Password"
-elif [[ -s "$OP_ENV" && "$OP_AUTH" != "prompt" ]]; then
-  info "op: token already present ($OP_ENV)"
 elif [[ -n "${OP_SERVICE_ACCOUNT_TOKEN:-}" && "$OP_AUTH" != "prompt" ]]; then
-  write_op_env "$OP_SERVICE_ACCOUNT_TOKEN"
-  info "op: token taken from the environment, stored in $OP_ENV (mode 600)"
+  # A token in the environment wins over the stored one, so a provisioner can
+  # rotate it. ~/.bashrc sources op.env, so it is often the same token.
+  # shellcheck source=/dev/null
+  if [[ "$( [[ -r "$OP_ENV" ]] && . "$OP_ENV"; printf '%s' "${OP_SERVICE_ACCOUNT_TOKEN:-}")" == "$OP_SERVICE_ACCOUNT_TOKEN" && -s "$OP_ENV" ]]; then
+    info "op: token already present ($OP_ENV)"
+  else
+    write_op_env "$OP_SERVICE_ACCOUNT_TOKEN"
+    info "op: token taken from the environment, stored in $OP_ENV (mode 600)"
+  fi
+elif [[ -s "$OP_ENV" && "$OP_AUTH" != "prompt" ]]; then
+  # shellcheck source=/dev/null
+  . "$OP_ENV"
+  info "op: token already present ($OP_ENV)"
 elif [[ $HAVE_TTY -eq 1 ]]; then
   if prompt_op_token; then
     write_op_env "$OP_TOKEN"
@@ -1165,40 +1359,73 @@ else
   info "op: no token supplied — set OP_SERVICE_ACCOUNT_TOKEN, or re-run with a terminal"
 fi
 
+# Resolve the vault here, in this shell, so the lookups below share it.
+OP_READY=0
+if [[ "$OP_AUTH" != "skip" && -n "${OP_SERVICE_ACCOUNT_TOKEN:-}" ]] && op_vault; then
+  OP_READY=1
+  info "op: reading secrets from vault '$OP_VAULT'"
+fi
+
 # --- 10e. OpenRouter API key ----------------------------------------------
-# Before the terminal gate for the same reason as 10d: a key in the
-# environment needs no terminal. Unlike the 1Password token, a key in the
-# environment replaces a stored one, so a provisioner can rotate the key by
-# re-running this script with the new one.
+# Read from the 1Password item OPENROUTER_API_KEY. A value that differs from
+# the stored one replaces it, so rotating the key is: change it in the vault,
+# re-run this script. Before the terminal gate for the same reason as 10d.
 OR_STORED=""
 [[ -r "$OPENROUTER_ENV" ]] \
   && OR_STORED="$(sed -n 's/^OPENROUTER_API_KEY=//p' "$OPENROUTER_ENV" | tail -n 1)"
-if [[ "$OPENROUTER_AUTH" == "skip" ]]; then
-  info "openrouter: OPENROUTER_AUTH=skip — not configuring OPENROUTER_API_KEY"
-elif [[ "$OPENROUTER_AUTH" == "auto" && -n "${OPENROUTER_API_KEY:-}" ]]; then
-  if [[ "$OPENROUTER_API_KEY" == "$OR_STORED" ]]; then
-    info "openrouter: key already stored ($OPENROUTER_ENV)"
-  elif check_openrouter_key "$OPENROUTER_API_KEY"; then
-    write_openrouter_env "$OPENROUTER_API_KEY"
-    info "openrouter: key taken from the environment, stored in $OPENROUTER_ENV (mode 600)"
+if [[ $OP_READY -eq 0 ]]; then
+  if [[ -n "$OR_STORED" ]]; then
+    info "openrouter: no 1Password access; kept the stored key ($OPENROUTER_ENV)"
   else
-    warn "openrouter: the key in OPENROUTER_API_KEY was not stored"
+    info "openrouter: no 1Password access — OPENROUTER_API_KEY not configured"
   fi
-elif [[ "$OPENROUTER_AUTH" == "auto" && -n "$OR_STORED" ]]; then
-  info "openrouter: key already stored ($OPENROUTER_ENV)"
-elif [[ $HAVE_TTY -eq 1 ]]; then
-  if prompt_openrouter_key; then
+elif OR_KEY="$(op_secret OPENROUTER_API_KEY)"; then
+  if [[ "$OR_KEY" == "$OR_STORED" ]]; then
+    info "openrouter: key already stored ($OPENROUTER_ENV)"
+  elif check_openrouter_key "$OR_KEY"; then
     write_openrouter_env "$OR_KEY"
-    unset OR_KEY
-    info "openrouter: key stored in $OPENROUTER_ENV (mode 600) and sourced from ~/.bashrc"
-  elif [[ -n "$OR_STORED" ]]; then
-    info "openrouter: no new key; kept the stored one ($OPENROUTER_ENV)"
+    info "openrouter: key read from 1Password, stored in $OPENROUTER_ENV (mode 600)"
   else
-    warn "no key stored; opencode cannot use OpenRouter until OPENROUTER_API_KEY is set"
+    warn "openrouter: the key in 1Password (OPENROUTER_API_KEY) was not stored"
+  fi
+  unset OR_KEY
+elif op_item_missing OPENROUTER_API_KEY; then
+  # The vault answered and the item is gone: 1Password is the source of truth,
+  # so deleting the item revokes this machine's copy too.
+  if [[ -n "$OR_STORED" ]]; then
+    rm -f "$OPENROUTER_ENV"
+    unset OPENROUTER_API_KEY
+    systemctl --user daemon-reload
+    OR_WRITTEN=1
+    warn "openrouter: no item OPENROUTER_API_KEY in vault '$OP_VAULT' — removed the stored key"
+  else
+    warn "openrouter: no item OPENROUTER_API_KEY in vault '$OP_VAULT'"
   fi
 else
-  info "openrouter: no key supplied — set OPENROUTER_API_KEY, or re-run with a terminal"
+  warn "openrouter: could not read OPENROUTER_API_KEY from 1Password${OR_STORED:+; kept the stored key}"
 fi
+
+# --- 10f. hob license -----------------------------------------------------
+# Read from the 1Password item HOB_LICENSE_KEY, only when hob has no active
+# license, and handed over on stdin so it never reaches argv. hob keeps the
+# activation itself, and the running service picks it up without a restart.
+if [[ "$HOB" == "1" && -x "$HOB_BIN" ]]; then
+  if "$HOB_BIN" app license status </dev/null 2>/dev/null | grep -q '^License: active'; then
+    info "hob: license already active"
+  elif [[ $OP_READY -eq 0 ]]; then
+    info "hob: no 1Password access — license not activated (read-only mode)"
+  elif HOB_KEY="$(op_secret HOB_LICENSE_KEY)"; then
+    if printf '%s' "$HOB_KEY" | "$HOB_BIN" app license activate --key-stdin >/dev/null; then
+      info "hob: license activated from 1Password"
+    else
+      warn "hob: license activation failed; check HOB_LICENSE_KEY in vault '$OP_VAULT'"
+    fi
+    unset HOB_KEY
+  else
+    warn "hob: no item HOB_LICENSE_KEY in vault '$OP_VAULT' — hob stays read-only"
+  fi
+fi
+
 # A running service keeps the environment it started with and reads
 # settings.json once at startup. Do not restart T3 Code from here: this script
 # can itself run in a T3 Code terminal.
@@ -1207,6 +1434,18 @@ if [[ "${OR_WRITTEN:-0}" == 1 || "${T3_SETTINGS_CHANGED:-0}" == 1 ]] \
   info "T3 Code was already running; restart it to pick up the OpenRouter key"
   info "and the OpenCode provider setting:"
   info "    systemctl --user restart t3code"
+fi
+# hob's agents (opencode among them) inherit hob's environment, which it got
+# when step 9c started it — before the key above was written. Restart it so
+# they see the new key, unless this script runs inside hob.
+if [[ "${OR_WRITTEN:-0}" == 1 ]] && systemctl --user is-active --quiet hob.service; then
+  if grep -qs '/hob\.service$' /proc/self/cgroup; then
+    info "hob is running this script; restart it afterwards to pick up the OpenRouter key:"
+    info "    systemctl --user restart hob"
+  else
+    systemctl --user restart hob.service
+    info "restarted hob so its agents pick up the OpenRouter key"
+  fi
 fi
 
 if [[ $HAVE_TTY -eq 0 ]]; then
@@ -1424,6 +1663,28 @@ else
   T3_PAIR_STEP="" T3_SERVICES=""
 fi
 
+if [[ "$HOB" == "1" && -x "$HOB_BIN" ]]; then
+  HOB_STATUS="$("$HOB_BIN" app version 2>/dev/null </dev/null)  ($(systemctl --user is-active hob.service || true), license $("$HOB_BIN" app license status </dev/null 2>/dev/null | sed -n 's/^License: //p'))"
+  HOB_PAIR_STEP="
+    6. Connect the hob desktop app (2.4.1+): computer button at the left of the
+       titlebar → Connect to a new computer → SSH machine → this host. If it
+       asks for approval here:
+           hob connection pending
+           hob connection approve <id>     # once the code matches
+"
+  HOB_SERVICES="   systemctl --user status hob             # hob
+       systemctl --user restart hob
+       journalctl --user -u hob -f
+
+    "
+elif [[ "$HOB" == "1" ]]; then
+  HOB_STATUS="NOT installed — see the hob step above"
+  HOB_PAIR_STEP="" HOB_SERVICES=""
+else
+  HOB_STATUS="skipped (HOB=0)"
+  HOB_PAIR_STEP="" HOB_SERVICES=""
+fi
+
 cat <<SUMMARY
     gh          $(gh --version | head -1)  ($(gh auth status --hostname github.com >/dev/null 2>&1 && echo 'signed in' || echo 'NOT signed in'))
     codex       $(codex --version 2>&1 | head -1)  ($(
@@ -1431,8 +1692,9 @@ cat <<SUMMARY
                   elif codex login status >/dev/null 2>&1; then echo 'signed in'
                   else echo 'NOT signed in'; fi))
     claude      $(claude --version 2>&1 | head -1)  ($([[ -s "$CLAUDE_CREDS" ]] && echo 'signed in' || echo 'NOT signed in'))
-    opencode    $("$OPENCODE_BIN" --version 2>&1 </dev/null | head -1)  ($([[ -s "$OPENROUTER_ENV" ]] && echo 'OpenRouter key stored' || echo 'no OpenRouter key — re-run with OPENROUTER_API_KEY set'))
-    op          $(op --version 2>&1 | head -1)  ($([[ -s "$OP_ENV" ]] && echo 'token stored' || echo 'no token — OP_AUTH=auto to add one'))
+    opencode    $("$OPENCODE_BIN" --version 2>&1 </dev/null | head -1)  ($([[ -s "$OPENROUTER_ENV" ]] && echo 'OpenRouter key stored' || echo 'no OpenRouter key — add OPENROUTER_API_KEY to 1Password and re-run'))
+    op          $(op --version 2>&1 | head -1)  ($([[ -s "$OP_ENV" ]] && echo 'token stored' || echo 'no token — set OP_SERVICE_ACCOUNT_TOKEN and re-run'))
+    hob         ${HOB_STATUS}
     t3          ${T3_STATUS}
     codex-lb    ${LB_STATUS}
     app-server  $(codex app-server daemon version 2>/dev/null | (jq -r '.status // "unknown"' 2>/dev/null || cat))
@@ -1453,16 +1715,16 @@ ${T3_PAIR_STEP}
        detected", set prompt injection detection to "flag" on the guardrails
        that cover the key. The opencode plugin only fixes opencode's own text.
 
-    5. See which credentials this machine can reach (no names are baked in —
-       ask 1Password, so a credential added to the vault later just shows up;
-       store a service account token first with OP_AUTH=auto ./setup.sh):
+    5. See which credentials this machine can reach. Setup itself reads
+       OPENROUTER_API_KEY and HOB_LICENSE_KEY; anything else in the vault is
+       one op read away:
            op vault list
            op item list --vault <vault>
            op read "op://<vault>/<item>/<field>"
-
+${HOB_PAIR_STEP}
     Managing the services
     ---------------------
-    ${LB_SERVICES}${T3_SERVICES}   codex app-server daemon version         # app-server
+    ${LB_SERVICES}${T3_SERVICES}${HOB_SERVICES}   codex app-server daemon version         # app-server
        codex app-server daemon restart
        tail -f ~/.codex/app-server-control/app-server.log
 
