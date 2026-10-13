@@ -13,7 +13,7 @@
 #   * opencode                 via https://opencode.ai/install, plus a plugin
 #                              that stops OpenRouter's prompt-injection
 #                              guardrail from blocking opencode's own prompts
-#   * T3 Code (default on)     release tarball + its systemd --user service,
+#   * T3 Code (opt-in)         release tarball + its systemd --user service,
 #                              with its OpenCode provider switched on
 #   * hob (default on)         verified release binary + a systemd --user
 #                              service running `hob --headless`
@@ -48,8 +48,7 @@
 #   CODEX_AUTH        login (device auth, default) | skip — ignored when
 #                     CODEX_LB=1, where the accounts live in codex-lb
 #   CLAUDE_AUTH       login (browser OAuth, default) | token (setup-token) | skip
-#   T3CODE            0 to skip installing T3 Code and its service
-#                                                         (default: 1)
+#   T3CODE            1 to install T3 Code and its service (default: 0)
 #   T3_PAIR_TTL       lifetime of the T3 Code pairing token printed at the end
 #                     when Tailscale is up                (default: 15m)
 #   HOB               0 to skip installing hob and its service
@@ -137,9 +136,9 @@ esac
 # Empty means "the only vault the token can see"; see op_vault.
 OP_VAULT="${OP_VAULT:-}"
 # T3 Code (https://github.com/pingdotgg/t3code) is a web UI over the Claude Code
-# and Codex CLIs installed above. On by default; T3CODE=0 skips it. Like
+# and Codex CLIs installed above. Off by default; T3CODE=1 installs it. Like
 # CODEX_LB, skipping means "do not set it up", not "tear it down".
-T3CODE="${T3CODE:-1}"
+T3CODE="${T3CODE:-0}"
 case "$T3CODE" in
   1 | true | yes) T3CODE=1 ;;
   0 | false | no) T3CODE=0 ;;
@@ -1042,7 +1041,7 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 9b. T3 Code — install and background service   (default on: T3CODE=0 skips)
+# 9b. T3 Code — install and background service   (opt-in: T3CODE=1 enables)
 # ---------------------------------------------------------------------------
 # From the GitHub release tarball, not `npx t3`. The npm package keeps its
 # binary in a per-platform optional dependency that bundles node-pty, and npm
