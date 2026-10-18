@@ -39,6 +39,8 @@
 # Environment overrides:
 #   CODEX_MODEL       model written to config.toml        (default: gpt-5.6-sol)
 #   CODEX_EFFORT      model_reasoning_effort              (default: xhigh)
+#   OPENCODE_MODEL    opencode's model and small_model    (default:
+#                     openrouter/z-ai/glm-5.3)
 #   CODEX_LB          1 to install codex-lb and route Codex through it
 #                                                         (default: 0)
 #   CODEX_LB_HOST     interface codex-lb binds to         (default: 0.0.0.0)
@@ -79,6 +81,7 @@ set -euo pipefail
 
 CODEX_MODEL="${CODEX_MODEL:-gpt-5.6-sol}"
 CODEX_EFFORT="${CODEX_EFFORT:-xhigh}"
+OPENCODE_MODEL="${OPENCODE_MODEL:-openrouter/z-ai/glm-5.3}"
 # codex-lb pools several ChatGPT accounts behind a local endpoint. That is a
 # minority setup, and it costs a systemd service, an open port holding account
 # tokens, and a config.toml that no longer works if the service is down — so it
@@ -171,6 +174,7 @@ T3_SETTINGS="$T3_HOME/userdata/settings.json"
 # opencode and systemd both read XDG_CONFIG_HOME, so these paths follow it.
 OPENCODE_BIN="$HOME/.opencode/bin/opencode"
 OPENCODE_PLUGIN="${XDG_CONFIG_HOME:-$HOME/.config}/opencode/plugins/openrouter-guardrail.js"
+OPENCODE_CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/opencode"
 OPENROUTER_ENV="${XDG_CONFIG_HOME:-$HOME/.config}/environment.d/60-openrouter.conf"
 HOB_BIN="$LOCAL_BIN/hob"
 HOB_UNIT="$UNIT_DIR/hob.service"
@@ -781,6 +785,21 @@ OC_PLUGIN_EOF
 chmod 644 "$OC_PLUGIN_TMP"
 mv -f "$OC_PLUGIN_TMP" "$OPENCODE_PLUGIN"
 info "wrote $OPENCODE_PLUGIN"
+
+# Default model, set on every run like CODEX_MODEL. small_model too: opencode
+# otherwise picks one from the provider, which may be a model the key cannot
+# use. opencode reads opencode.jsonc or opencode.json; jq cannot read a file
+# with comments, so such a file is left alone rather than rewritten without them.
+OPENCODE_CONFIG="$OPENCODE_CONFIG_DIR/opencode.jsonc"
+[[ -e "$OPENCODE_CONFIG" ]] || OPENCODE_CONFIG="$OPENCODE_CONFIG_DIR/opencode.json"
+[[ -s "$OPENCODE_CONFIG" ]] || echo '{"$schema": "https://opencode.ai/config.json"}' >"$OPENCODE_CONFIG"
+if jq --arg m "$OPENCODE_MODEL" '.model = $m | .small_model = $m' "$OPENCODE_CONFIG" \
+    >"$TMPWORK/opencode.json" 2>/dev/null; then
+  cat "$TMPWORK/opencode.json" >"$OPENCODE_CONFIG"
+  info "model $OPENCODE_MODEL ($OPENCODE_CONFIG)"
+else
+  warn "could not parse $OPENCODE_CONFIG (comments?); set \"model\": \"$OPENCODE_MODEL\" there yourself"
+fi
 info "opencode $("$OPENCODE_BIN" --version 2>&1 | head -1)"
 
 # ---------------------------------------------------------------------------
@@ -1709,7 +1728,7 @@ ${T3_PAIR_STEP}
            codex doctor
            codex exec 'say hi'
            opencode models openrouter | head
-           opencode run -m openrouter/<model from the list> 'say hi'
+           opencode run 'say hi'      # uses $OPENCODE_MODEL
        If OpenRouter answers 403 "Request blocked: prompt injection patterns
        detected", set prompt injection detection to "flag" on the guardrails
        that cover the key. The opencode plugin only fixes opencode's own text.
